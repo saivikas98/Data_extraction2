@@ -211,6 +211,23 @@ def extract_production_counters(text, sorted_text=""):
     return frame
 
 
+def extract_filling_speed(text, sorted_text=""):
+    combined = f"{text}\n{sorted_text}"
+    match = re.search(
+        r"Filling\s*speed\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*([^\n]*)",
+        combined,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return pd.DataFrame(columns=["Parameter", "Value", "Unit"])
+
+    value = float(match.group(1).replace(",", "."))
+    unit = normalize_space(match.group(2)) or "syringes/min"
+    return pd.DataFrame(
+        [{"Parameter": "Filling Speed", "Value": value, "Unit": unit}]
+    )
+
+
 # =====================================================
 # FILL WEIGHT TABLE
 # =====================================================
@@ -721,6 +738,7 @@ try:
         full_text, sorted_full_text, pages = extract_pdf_pages(pdf_bytes)
         summary_df = extract_batch_summary(full_text)
         production_df = extract_production_counters(full_text, sorted_full_text)
+        filling_speed_df = extract_filling_speed(full_text, sorted_full_text)
         fill_df = extract_fill_weights(full_text, sorted_full_text, pages)
         safety_df = extract_safety_alarms(pages)
         gmp_df = extract_gmp_alarms(pages)
@@ -789,13 +807,28 @@ with summary_tab:
     c2.metric("Fill Weight Passed", f"{passed_fill_records:,}")
     c3.metric("Fill Weight Not Passed", f"{rejected_fill_records:,}")
     c4.metric("Pass Rate", f"{pass_rate:.2f}%")
-    a1, a2, a3 = st.columns(3)
+    a1, a2, a3, a4 = st.columns(4)
     all_alarm_count = len(safety_df) + len(gmp_df) + len(equipment_df)
     a1.metric("All Alarm Events", f"{all_alarm_count:,}")
     a2.metric("Audit Records", f"{len(audit_df):,}")
     a3.metric("PDF Pages", f"{len(pages):,}")
+    if not filling_speed_df.empty:
+        speed_value = filling_speed_df.iloc[0]["Value"]
+        speed_unit = filling_speed_df.iloc[0]["Unit"]
+        a4.metric("Filling Speed", f"{speed_value:g} {speed_unit}")
+    else:
+        a4.metric("Filling Speed", "Not detected")
 
 with production_tab:
+    st.subheader("Filling Speed")
+    if filling_speed_df.empty:
+        st.warning("Filling speed was not detected in the report.")
+    else:
+        filling_speed_value = filling_speed_df.iloc[0]["Value"]
+        filling_speed_unit = filling_speed_df.iloc[0]["Unit"]
+        st.metric("Filling Speed", f"{filling_speed_value:g} {filling_speed_unit}")
+        st.dataframe(filling_speed_df, use_container_width=True, hide_index=True)
+
     st.subheader("Production Counters")
     if production_df.empty:
         st.warning("Production counter labels or values were not recognized. See Extraction diagnostics for the detected page text.")
@@ -870,8 +903,55 @@ with fill_tab:
             )
             graph_df = fill_pass_df[fill_pass_df["Position"].isin(selected_positions)].copy()
 
+            st.markdown("#### Scatter Plot Axis Limits")
+            axis_col_1, axis_col_2 = st.columns(2)
+            with axis_col_1:
+                auto_x_limits = st.checkbox("Automatic X-axis limits", value=True)
+                default_x_min = 1.0
+                default_x_max = float(max(len(graph_df), 1))
+                scatter_x_min = st.number_input(
+                    "X-axis minimum",
+                    value=default_x_min,
+                    disabled=auto_x_limits,
+                    key="scatter_x_min",
+                )
+                scatter_x_max = st.number_input(
+                    "X-axis maximum",
+                    value=default_x_max,
+                    disabled=auto_x_limits,
+                    key="scatter_x_max",
+                )
+            with axis_col_2:
+                auto_y_limits = st.checkbox("Automatic Y-axis limits", value=True)
+                if not graph_df.empty:
+                    default_y_min = float(graph_df["Nett Weight"].min()) - 1.0
+                    default_y_max = float(graph_df["Nett Weight"].max()) + 1.0
+                else:
+                    default_y_min, default_y_max = 520.0, 550.0
+                scatter_y_min = st.number_input(
+                    "Y-axis minimum",
+                    value=default_y_min,
+                    disabled=auto_y_limits,
+                    key="scatter_y_min",
+                )
+                scatter_y_max = st.number_input(
+                    "Y-axis maximum",
+                    value=default_y_max,
+                    disabled=auto_y_limits,
+                    key="scatter_y_max",
+                )
+
+            invalid_axis_limits = (
+                (not auto_x_limits and scatter_x_min >= scatter_x_max)
+                or (not auto_y_limits and scatter_y_min >= scatter_y_max)
+            )
+            if invalid_axis_limits:
+                st.error("Axis minimum must be lower than axis maximum.")
+
             if graph_df.empty:
                 st.warning("Select at least one filling position to display the graphs.")
+            elif invalid_axis_limits:
+                st.warning("Correct the scatter-plot axis limits to display the graphs.")
             else:
                 scatter_figure = make_fill_scatter(
                     graph_df,
@@ -886,8 +966,15 @@ with fill_tab:
                     scatter_figure,
                     show_x_grid=show_x_grid,
                     show_y_grid=show_y_grid,
-                    show_range_slider=show_range_slider,
+                    show_range_slider=False,
                 )
+
+                # Apply user-defined visible axis limits to the scatter plot.
+                if not auto_x_limits:
+                    scatter_figure.update_xaxes(range=[scatter_x_min, scatter_x_max])
+                if not auto_y_limits:
+                    scatter_figure.update_yaxes(range=[scatter_y_min, scatter_y_max])
+
                 st.plotly_chart(
                     scatter_figure,
                     use_container_width=True,
@@ -1126,6 +1213,7 @@ excel_file = build_excel(
     {
         "Batch Summary": summary_df,
         "Production Counters": production_df,
+        "Filling Speed": filling_speed_df,
         "Fill Weight All": fill_df,
         "Fill Weight Passed": fill_pass_df,
         "All Alarms": all_alarms_df,
