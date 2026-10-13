@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import fitz
+import pymupdf as fitz
 import re
 
 from io import BytesIO
