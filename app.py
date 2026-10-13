@@ -625,14 +625,13 @@ PLOTLY_CONFIG = {
     "displaylogo": False,
     "scrollZoom": True,
     "displayModeBar": True,
-    "modeBarButtonsToAdd": [
-        "drawline",
-        "drawopenpath",
-        "drawrect",
-        "drawcircle",
-        "eraseshape",
-        "toggleSpikelines",
-    ],
+    "editable": True,
+    "edits": {
+        "axisTitleText": True,
+        "legendText": True,
+        "annotationText": True,
+        "titleText": True,
+    },
     "toImageButtonOptions": {
         "format": "png",
         "filename": "interactive_graph",
@@ -644,18 +643,18 @@ PLOTLY_CONFIG = {
 
 
 def make_interactive(fig, show_x_grid=True, show_y_grid=True, show_range_slider=False):
+    # Keep only layout properties supported across older and newer Plotly versions.
+    # Graph editing is enabled through the Plotly config passed to st.plotly_chart.
     fig.update_layout(
         dragmode="zoom",
         hovermode="closest",
         clickmode="event+select",
         selectdirection="any",
         uirevision="keep-user-zoom",
-        editable=True,
-        newshape=dict(line_color="#c00000", line_width=2),
     )
     fig.update_xaxes(
         showgrid=show_x_grid,
-        rangeslider=dict(visible=show_range_slider),
+        rangeslider_visible=show_range_slider,
         showspikes=True,
         spikemode="across",
         spikesnap="cursor",
