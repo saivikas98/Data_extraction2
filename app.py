@@ -65,7 +65,7 @@ def find_section_bounds(pages, include_terms, stop_terms=None):
 # PDF TEXT EXTRACTION
 # =====================================================
 @st.cache_data(show_spinner=False)
-def extract_pdf_pages(pdf_bytes, parser_version="2026-10-13-v5"):
+def extract_pdf_pages(pdf_bytes, parser_version="2026-10-13-v6"):
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
 
@@ -527,6 +527,60 @@ def extract_audit_trail(pages):
         value = re.sub(r"(?<!\w)_+(?!\w)", " ", value)
         return normalize_space(value)
 
+    def refine_audit_text(value):
+        """Repair words split by narrow PDF table cells without changing meaning."""
+        value = clean_cell(value)
+        if not value:
+            return ""
+
+        # Exact fragment repairs observed in this report and common HMI audit text.
+        replacements = {
+            r"\bN\s+ot\b": "Not",
+            r"\bH\s+MI\b": "HMI",
+            r"\bP\s+LC\b": "PLC",
+            r"\bCon\s+nection\b": "Connection",
+            r"\bConn\s+ection\b": "Connection",
+            r"\bPowere\s+d\b": "Powered",
+            r"\blogg\s+ed\b": "logged",
+            r"\bM\s+anager\b": "Manager",
+            r"\bv\s+alue\b": "value",
+            r"\bBat\s+ch\b": "Batch",
+            r"\bR\s+obot\b": "Robot",
+            r"\bG\s+eneral\b": "General",
+            r"\bU\s+nit\b": "Unit",
+            r"\bG\s+uarding\b": "Guarding",
+            r"\bD\s+oors\b": "Doors",
+            r"\badministr\s+ation\b": "administration",
+            r"\bAcknowledge\s+ment\b": "Acknowledgment",
+            r"\bdescrip\s+tion\b": "description",
+            r"\bproduc\s+tion\b": "production",
+            r"\binter\s+face\b": "interface",
+            r"\bInterface\s+PMQ\b": "Interface PMQ",
+        }
+        for pattern, replacement in replacements.items():
+            value = re.sub(pattern, replacement, value, flags=re.IGNORECASE)
+
+        # Repair known technical identifiers split by the narrow UserID column.
+        value = re.sub(r"\bINF11DP\s+R-E(\d+)\b", r"INF11DPR-E\1", value)
+        value = re.sub(r"/P\s+(\d{5,})\b", r"/P\1", value)
+        value = re.sub(r"\bHMI[_ ]?Con\s*nection[_ ]?(\d+)\b", r"HMI_Connection_\1", value, flags=re.IGNORECASE)
+        value = re.sub(r"\bHMI\s+Connection\s+(\d+)\b", r"HMI Connection \1", value, flags=re.IGNORECASE)
+
+        # Repair a single trailing letter split from a sufficiently long word,
+        # but only for endings commonly produced by column wrapping.
+        value = re.sub(
+            r"\b([A-Za-z]{4,})([ ]+)([dgry])\b",
+            lambda m: m.group(1) + m.group(3)
+            if (m.group(1) + m.group(3)).lower() in {
+                "powered", "logged", "manager", "empty", "running",
+                "stopped", "started", "changed", "closed", "opened",
+            }
+            else m.group(0),
+            value,
+            flags=re.IGNORECASE,
+        )
+        return normalize_space(value)
+
     def normalize_audit_timestamp(value):
         value = clean_cell(value)
         # The narrow timestamp column wraps the hour, e.g.
@@ -558,10 +612,10 @@ def extract_audit_trail(pages):
                 continue
 
             state = clean_cell(raw_row[1])
-            user = clean_cell(raw_row[2])
-            description = clean_cell(raw_row[3])
-            comment = clean_cell(raw_row[4])
-            category = clean_cell(raw_row[5])
+            user = refine_audit_text(raw_row[2])
+            description = refine_audit_text(raw_row[3])
+            comment = refine_audit_text(raw_row[4])
+            category = refine_audit_text(raw_row[5])
 
             # Category sometimes contains an alarm number such as "Alarm: 525".
             # Preserve it exactly rather than discarding the field.
@@ -1396,6 +1450,6 @@ with st.expander("Extraction diagnostics"):
                     na=False,
                 ).sum()
             ) if not all_alarms_df.empty else 0,
-            "Parser version": "2026-10-13-v5",
+            "Parser version": "2026-10-13-v6",
         }
     )
