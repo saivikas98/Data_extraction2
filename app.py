@@ -70,12 +70,23 @@ def extract_pdf_pages(pdf_bytes):
     pages = []
 
     for page_number, page in enumerate(document, start=1):
-        page_text = page.get_text("text", sort=True) or ""
-        pages.append({"Page": page_number, "Text": page_text})
+        # Unsorted text often preserves report table reading order better.
+        raw_text = page.get_text("text", sort=False) or ""
+        sorted_text = page.get_text("text", sort=True) or ""
+        words = page.get_text("words", sort=True) or []
+        pages.append(
+            {
+                "Page": page_number,
+                "Text": raw_text,
+                "Sorted Text": sorted_text,
+                "Words": words,
+            }
+        )
 
     document.close()
     full_text = "\n".join(page["Text"] for page in pages)
-    return full_text, pages
+    sorted_full_text = "\n".join(page["Sorted Text"] for page in pages)
+    return full_text, sorted_full_text, pages
 
 
 # =====================================================
@@ -124,90 +135,88 @@ def extract_batch_summary(text):
 # =====================================================
 # PRODUCTION COUNTERS
 # =====================================================
-def extract_production_counters(text):
-    counter_names = [
-        "Infeed",
-        "Outfeed",
-        "Reject",
-        "Accepted",
-        "Produced",
-        "Total",
-    ]
+def extract_production_counters(text, sorted_text=""):
+    columns = ["Counter", "Value"]
+    combined = f"{text}\n{sorted_text}"
     rows = []
+    aliases = {
+        "Infeed": ["infeed", "in feed", "input"],
+        "Outfeed": ["outfeed", "out feed", "output"],
+        "Reject": ["reject", "rejected"],
+        "Accepted": ["accepted", "good units", "good products"],
+        "Produced": ["produced", "production quantity"],
+        "Total": ["total counter", "total produced"],
+    }
 
-    section_match = re.search(
-        r"Production\s*Counters?\s*:?(.*?)(?=\n\s*(?:Fill\s*Weight|Check\s*Weigh|Alarms?|Audit\s*Trail)|$)",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    section = section_match.group(1) if section_match else text
-
-    for name in counter_names:
-        match = re.search(
-            rf"\b{re.escape(name)}\b\s*[:=-]?\s*(\d+)",
-            section,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            rows.append({"Counter": name, "Value": int(match.group(1))})
-
-    if not rows:
-        lines = [normalize_space(line) for line in section.splitlines() if line.strip()]
-        for index, line in enumerate(lines):
-            if "production counter" in line.lower():
-                for candidate in lines[index + 1 : index + 15]:
-                    match = re.match(r"(.+?)\s*[:=-]?\s*(\d+)$", candidate)
-                    if match:
-                        rows.append(
-                            {
-                                "Counter": normalize_space(match.group(1)),
-                                "Value": int(match.group(2)),
-                            }
-                        )
+    # Handles both "Infeed 1640" and vertical extraction "Infeed\n1640".
+    for canonical, names in aliases.items():
+        for name in names:
+            match = re.search(
+                rf"(?im)^\s*{re.escape(name)}\s*[:=\-]?\s*(?:\n\s*)?([0-9][0-9,]*)\s*$",
+                combined,
+            )
+            if match:
+                rows.append(
+                    {"Counter": canonical, "Value": int(match.group(1).replace(",", ""))}
+                )
                 break
 
-    return pd.DataFrame(rows, columns=["Counter", "Value"])
+    # Fallback for a section where labels are followed by values on subsequent lines.
+    if not rows:
+        match = re.search(
+            r"Production\s*Counters?\s*:?(.*?)(?=Fill\s*Weight|Check\s*Weigh|Alarm|Audit|$)",
+            combined,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        section = match.group(1) if match else ""
+        tokens = [normalize_space(x) for x in section.splitlines() if normalize_space(x)]
+        for i, token in enumerate(tokens):
+            for canonical, names in aliases.items():
+                if token.lower() in names:
+                    for next_token in tokens[i + 1 : i + 4]:
+                        number = re.fullmatch(r"[0-9][0-9,]*", next_token)
+                        if number:
+                            rows.append(
+                                {
+                                    "Counter": canonical,
+                                    "Value": int(next_token.replace(",", "")),
+                                }
+                            )
+                            break
+
+    frame = pd.DataFrame(rows, columns=columns)
+    if not frame.empty:
+        frame = frame.drop_duplicates(subset=["Counter"], keep="first").reset_index(drop=True)
+    return frame
 
 
 # =====================================================
 # FILL WEIGHT TABLE
 # =====================================================
-def extract_fill_weights(text):
-    columns = [
-        "Timestamp",
-        "Nett Weight",
-        "Gross Weight",
-        "Tare Weight",
-        "Weight Passed",
-        "Air Bubble",
-        "Needle Bonding",
-        "Assembly",
-        "Position",
-    ]
-
-    # The final flags can appear as 0, 1 or hyphen. Position is expected as 1-4.
+def _parse_fill_weight_stream(text):
+    rows = []
+    # Whitespace includes line breaks, so this handles horizontal and vertically split rows.
     pattern = re.compile(
         r"(\d{2}/\d{2}/\d{4})\s+"
         r"(\d{2}:\d{2}:\d{2})\s+"
-        r"(-?\d+(?:\.\d+)?)\s+"
-        r"(-?\d+(?:\.\d+)?)\s+"
-        r"(-?\d+(?:\.\d+)?)\s+"
+        r"(-?\d+(?:[.,]\d+)?)\s+"
+        r"(-?\d+(?:[.,]\d+)?)\s+"
+        r"(-?\d+(?:[.,]\d+)?)\s+"
         r"([01])\s+"
         r"([01-])\s+"
         r"([01-])\s+"
         r"([01-])\s+"
-        r"([1-4])(?:\s|$)",
+        r"([1-4])(?=\s|$)",
         flags=re.MULTILINE,
     )
-
-    rows = []
     for match in pattern.finditer(text):
+        values = [match.group(i).replace(",", ".") for i in (3, 4, 5)]
         rows.append(
             {
                 "Timestamp": f"{match.group(1)} {match.group(2)}",
-                "Nett Weight": float(match.group(3)),
-                "Gross Weight": float(match.group(4)),
-                "Tare Weight": float(match.group(5)),
+                "Nett Weight": float(values[0]),
+                "Gross Weight": float(values[1]),
+                "Tare Weight": float(values[2]),
                 "Weight Passed": int(match.group(6)),
                 "Air Bubble": match.group(7),
                 "Needle Bonding": match.group(8),
@@ -215,13 +224,64 @@ def extract_fill_weights(text):
                 "Position": int(match.group(10)),
             }
         )
+    return rows
+
+
+def _words_to_visual_lines(words, y_tolerance=2.5):
+    """Rebuild visual rows from PyMuPDF words using y coordinates."""
+    if not words:
+        return []
+    ordered = sorted(words, key=lambda w: (round(w[1] / y_tolerance), w[0]))
+    lines = []
+    current = []
+    current_y = None
+    for word in ordered:
+        y = float(word[1])
+        if current_y is None or abs(y - current_y) <= y_tolerance:
+            current.append(word)
+            current_y = y if current_y is None else (current_y + y) / 2
+        else:
+            lines.append(" ".join(str(w[4]) for w in sorted(current, key=lambda x: x[0])))
+            current = [word]
+            current_y = y
+    if current:
+        lines.append(" ".join(str(w[4]) for w in sorted(current, key=lambda x: x[0])))
+    return lines
+
+
+def extract_fill_weights(text, sorted_text="", pages=None):
+    columns = [
+        "Timestamp", "Nett Weight", "Gross Weight", "Tare Weight",
+        "Weight Passed", "Air Bubble", "Needle Bonding", "Assembly", "Position",
+    ]
+    rows = []
+
+    # Try both native PDF reading orders first.
+    rows.extend(_parse_fill_weight_stream(text))
+    rows.extend(_parse_fill_weight_stream(sorted_text))
+
+    # Reconstruct visual lines from word coordinates when plain text order is column-wise.
+    if pages:
+        for page in pages:
+            lower = f"{page.get('Text', '')} {page.get('Sorted Text', '')}".lower()
+            is_candidate = any(
+                key in lower
+                for key in ["nett weight", "net weight", "gross weight", "tare weight", "weight passed"]
+            )
+            if not is_candidate:
+                continue
+            visual_text = "\n".join(_words_to_visual_lines(page.get("Words", [])))
+            rows.extend(_parse_fill_weight_stream(visual_text))
 
     frame = pd.DataFrame(rows, columns=columns)
     if not frame.empty:
-        frame["Timestamp"] = pd.to_datetime(
-            frame["Timestamp"], dayfirst=True, errors="coerce"
+        frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], dayfirst=True, errors="coerce")
+        frame = (
+            frame.dropna(subset=["Timestamp"])
+            .drop_duplicates()
+            .sort_values("Timestamp")
+            .reset_index(drop=True)
         )
-        frame = frame.drop_duplicates().sort_values("Timestamp").reset_index(drop=True)
     return frame
 
 
@@ -577,10 +637,10 @@ pdf_bytes = uploaded_file.getvalue()
 
 try:
     with st.spinner("Extracting and structuring the PDF report..."):
-        full_text, pages = extract_pdf_pages(pdf_bytes)
+        full_text, sorted_full_text, pages = extract_pdf_pages(pdf_bytes)
         summary_df = extract_batch_summary(full_text)
-        production_df = extract_production_counters(full_text)
-        fill_df = extract_fill_weights(full_text)
+        production_df = extract_production_counters(full_text, sorted_full_text)
+        fill_df = extract_fill_weights(full_text, sorted_full_text, pages)
         safety_df = extract_safety_alarms(pages)
         gmp_df = extract_gmp_alarms(pages)
         equipment_df = extract_equipment_alarms(pages)
@@ -614,226 +674,104 @@ histogram_bins = st.sidebar.slider("Histogram bins", min_value=5, max_value=60, 
 if lower_limit >= upper_limit:
     st.sidebar.error("Lower limit must be less than upper limit.")
 
+alarm_frames = [df for df in [safety_df, gmp_df, equipment_df] if not df.empty]
+all_alarms_df = pd.concat(alarm_frames, ignore_index=True) if alarm_frames else empty_dataframe(["Timestamp", "State", "Message", "Code", "Alarm Type"])
+if not all_alarms_df.empty:
+    all_alarms_df = all_alarms_df.sort_values("Timestamp").reset_index(drop=True)
+all_alarm_summary_df = create_alarm_summary(all_alarms_df)
+
 (
     summary_tab,
     production_tab,
     fill_tab,
-    safety_tab,
-    gmp_tab,
-    equipment_tab,
+    alarms_tab,
     audit_tab,
 ) = st.tabs(
-    [
-        "Summary",
-        "Production",
-        "Fill Weight",
-        "Safety Alarms",
-        "GMP Alarms",
-        "Equipment Alarms",
-        "Audit Trail",
-    ]
+    ["Summary", "Production", "Fill Weight", "All Alarms", "Audit Trail"]
 )
 
 with summary_tab:
     st.subheader("Batch Summary")
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
     total_fill_records = len(fill_df)
     passed_fill_records = len(fill_pass_df)
     rejected_fill_records = total_fill_records - passed_fill_records
-    pass_rate = (
-        passed_fill_records / total_fill_records * 100 if total_fill_records else 0.0
-    )
-
-    metric_1, metric_2, metric_3, metric_4 = st.columns(4)
-    metric_1.metric("Total Fill Records", f"{total_fill_records:,}")
-    metric_2.metric("Fill Weight Passed", f"{passed_fill_records:,}")
-    metric_3.metric("Fill Weight Not Passed", f"{rejected_fill_records:,}")
-    metric_4.metric("Pass Rate", f"{pass_rate:.2f}%")
-
-    event_1, event_2, event_3, event_4 = st.columns(4)
-    event_1.metric("Safety Alarm Events", f"{len(safety_df):,}")
-    event_2.metric("GMP Alarm Events", f"{len(gmp_df):,}")
-    event_3.metric("Equipment Alarm Events", f"{len(equipment_df):,}")
-    event_4.metric("Audit Records", f"{len(audit_df):,}")
+    pass_rate = passed_fill_records / total_fill_records * 100 if total_fill_records else 0.0
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Fill Records", f"{total_fill_records:,}")
+    c2.metric("Fill Weight Passed", f"{passed_fill_records:,}")
+    c3.metric("Fill Weight Not Passed", f"{rejected_fill_records:,}")
+    c4.metric("Pass Rate", f"{pass_rate:.2f}%")
+    a1, a2, a3 = st.columns(3)
+    all_alarm_count = len(safety_df) + len(gmp_df) + len(equipment_df)
+    a1.metric("All Alarm Events", f"{all_alarm_count:,}")
+    a2.metric("Audit Records", f"{len(audit_df):,}")
+    a3.metric("PDF Pages", f"{len(pages):,}")
 
 with production_tab:
     st.subheader("Production Counters")
     if production_df.empty:
-        st.warning("No structured production counters were detected.")
+        st.warning("Production counter labels or values were not recognized. See Extraction diagnostics for the detected page text.")
     else:
         st.dataframe(production_df, use_container_width=True, hide_index=True)
 
 with fill_tab:
     st.subheader("Fill Weight Passed Records")
-
     if fill_df.empty:
-        st.warning("No fill-weight records were detected in the PDF text.")
+        st.warning("Fill-weight rows were not recognized. The parser tried native text, sorted text and coordinate-based row reconstruction.")
     else:
-        fill_metric_1, fill_metric_2, fill_metric_3, fill_metric_4 = st.columns(4)
-        fill_metric_1.metric("Passed Records", f"{len(fill_pass_df):,}")
-        fill_metric_2.metric(
-            "Mean Nett Weight",
-            f"{fill_pass_df['Nett Weight'].mean():.2f}" if not fill_pass_df.empty else "N/A",
-        )
-        fill_metric_3.metric(
-            "Standard Deviation",
-            f"{fill_pass_df['Nett Weight'].std():.2f}" if len(fill_pass_df) > 1 else "N/A",
-        )
-        fill_metric_4.metric(
-            "Range",
-            (
-                f"{fill_pass_df['Nett Weight'].min():.2f} to "
-                f"{fill_pass_df['Nett Weight'].max():.2f}"
-                if not fill_pass_df.empty
-                else "N/A"
-            ),
-        )
-
-        display_filter = st.radio(
-            "Fill weight table",
-            ["Passed only", "All records"],
-            horizontal=True,
-        )
-        displayed_fill_df = fill_pass_df if display_filter == "Passed only" else fill_df
-        st.dataframe(displayed_fill_df, use_container_width=True, hide_index=True)
-
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Passed Records", f"{len(fill_pass_df):,}")
+        f2.metric("Mean Nett Weight", f"{fill_pass_df['Nett Weight'].mean():.2f}" if not fill_pass_df.empty else "N/A")
+        f3.metric("Standard Deviation", f"{fill_pass_df['Nett Weight'].std():.2f}" if len(fill_pass_df) > 1 else "N/A")
+        f4.metric("Range", f"{fill_pass_df['Nett Weight'].min():.2f} to {fill_pass_df['Nett Weight'].max():.2f}" if not fill_pass_df.empty else "N/A")
+        table_choice = st.radio("Fill weight table", ["Passed only", "All records"], horizontal=True)
+        shown = fill_pass_df if table_choice == "Passed only" else fill_df
+        st.dataframe(shown, use_container_width=True, hide_index=True)
         if not fill_pass_df.empty and lower_limit < upper_limit:
-            scatter_figure = make_fill_scatter(
-                fill_pass_df,
-                batch_label,
-                lower_limit,
-                upper_limit,
-            )
-            st.plotly_chart(scatter_figure, use_container_width=True)
+            st.plotly_chart(make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit), use_container_width=True)
+            st.plotly_chart(make_fill_histogram(fill_pass_df, batch_label, histogram_bins), use_container_width=True)
 
-            histogram_figure = make_fill_histogram(
-                fill_pass_df,
-                batch_label,
-                histogram_bins,
-            )
-            st.plotly_chart(histogram_figure, use_container_width=True)
-        elif fill_pass_df.empty:
-            st.warning("No records with Weight Passed = 1 were detected.")
-
-with safety_tab:
-    st.subheader("Safety Alarm Table")
-
-    if safety_df.empty:
-        st.warning("No structured Safety alarm records were detected.")
+with alarms_tab:
+    st.subheader("Combined Alarm Table")
+    if all_alarms_df.empty:
+        st.warning("No structured alarm records were detected.")
     else:
-        safety_metric_1, safety_metric_2, safety_metric_3 = st.columns(3)
-        safety_metric_1.metric("Total Alarm Events", f"{len(safety_df):,}")
-        safety_metric_2.metric("Unique Alarm Types", f"{len(safety_summary_df):,}")
-        safety_metric_3.metric(
-            "Repeated Alarm Types",
-            f"{int((safety_summary_df['Occurrences'] > 1).sum()):,}",
+        al1, al2, al3, al4 = st.columns(4)
+        al1.metric("Total Alarm Events", f"{len(all_alarms_df):,}")
+        al2.metric("Unique Alarm Types", f"{len(all_alarm_summary_df):,}")
+        al3.metric("Repeated Alarm Types", f"{int((all_alarm_summary_df['Occurrences'] > 1).sum()):,}")
+        al4.metric("Alarm Categories", f"{all_alarms_df['Alarm Type'].nunique():,}")
+        category_filter = st.multiselect(
+            "Alarm categories",
+            options=sorted(all_alarms_df["Alarm Type"].dropna().unique().tolist()),
+            default=sorted(all_alarms_df["Alarm Type"].dropna().unique().tolist()),
         )
-
-        st.dataframe(safety_df, use_container_width=True, hide_index=True)
-
-        st.subheader("Safety Alarm Frequency Summary")
-        st.dataframe(safety_summary_df, use_container_width=True, hide_index=True)
-
-        top_safety = safety_summary_df.head(20).sort_values("Occurrences")
-        if not top_safety.empty:
-            safety_chart = px.bar(
-                top_safety,
-                x="Occurrences",
-                y="Message",
-                orientation="h",
-                color_discrete_sequence=["#d9534f"],
-                hover_data=["Code"],
-            )
-            safety_chart = apply_graph_style(
-                safety_chart,
-                "Top Safety Alarms by Frequency",
-                "Occurrences",
-                "Alarm Message",
-            )
-            st.plotly_chart(safety_chart, use_container_width=True)
-
-with gmp_tab:
-    st.subheader("GMP Alarm Table")
-
-    if gmp_df.empty:
-        st.warning("No structured GMP alarm records were detected.")
-    else:
-        gmp_metric_1, gmp_metric_2, gmp_metric_3 = st.columns(3)
-        gmp_metric_1.metric("Total Alarm Events", f"{len(gmp_df):,}")
-        gmp_metric_2.metric("Unique Alarm Types", f"{len(gmp_summary_df):,}")
-        gmp_metric_3.metric(
-            "Repeated Alarm Types",
-            f"{int((gmp_summary_df['Occurrences'] > 1).sum()):,}",
-        )
-        st.dataframe(gmp_df, use_container_width=True, hide_index=True)
-        st.subheader("GMP Alarm Frequency Summary")
-        st.dataframe(gmp_summary_df, use_container_width=True, hide_index=True)
-
-with equipment_tab:
-    st.subheader("Equipment Alarm Table")
-
-    if equipment_df.empty:
-        st.warning("No structured Equipment alarm records were detected.")
-    else:
-        equipment_metric_1, equipment_metric_2, equipment_metric_3 = st.columns(3)
-        equipment_metric_1.metric("Total Alarm Events", f"{len(equipment_df):,}")
-        equipment_metric_2.metric("Unique Alarm Types", f"{len(equipment_summary_df):,}")
-        equipment_metric_3.metric(
-            "Repeated Alarm Types",
-            f"{int((equipment_summary_df['Occurrences'] > 1).sum()):,}",
-        )
-        st.dataframe(equipment_df, use_container_width=True, hide_index=True)
-        st.subheader("Equipment Alarm Frequency Summary")
-        st.dataframe(equipment_summary_df, use_container_width=True, hide_index=True)
+        filtered_alarms = all_alarms_df[all_alarms_df["Alarm Type"].isin(category_filter)]
+        st.dataframe(filtered_alarms, use_container_width=True, hide_index=True)
+        filtered_summary = create_alarm_summary(filtered_alarms)
+        st.subheader("Combined Alarm Frequency Summary")
+        st.dataframe(filtered_summary, use_container_width=True, hide_index=True)
+        top_alarm = filtered_summary.head(20).sort_values("Occurrences")
+        if not top_alarm.empty:
+            fig_alarm = px.bar(top_alarm, x="Occurrences", y="Message", orientation="h", color_discrete_sequence=["#d9534f"], hover_data=["Code"])
+            st.plotly_chart(apply_graph_style(fig_alarm, "Top Alarms by Frequency", "Occurrences", "Alarm Message"), use_container_width=True)
 
 with audit_tab:
     st.subheader("Audit Trail Table")
-
     if audit_df.empty:
         st.warning("No structured audit-trail records were detected.")
     else:
-        audit_metric_1, audit_metric_2, audit_metric_3 = st.columns(3)
-        audit_metric_1.metric("Total Audit Records", f"{len(audit_df):,}")
-        audit_metric_2.metric("Unique Actions", f"{len(audit_action_summary_df):,}")
-        audit_metric_3.metric(
-            "Repeated Actions",
-            f"{int((audit_action_summary_df['Occurrences'] > 1).sum()):,}",
-        )
-
+        au1, au2, au3 = st.columns(3)
+        au1.metric("Total Audit Records", f"{len(audit_df):,}")
+        au2.metric("Unique Actions", f"{len(audit_action_summary_df):,}")
+        au3.metric("Repeated Actions", f"{int((audit_action_summary_df['Occurrences'] > 1).sum()):,}")
         st.dataframe(audit_df, use_container_width=True, hide_index=True)
-
         st.subheader("Audit Action Frequency Summary")
-        st.dataframe(
-            audit_action_summary_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
+        st.dataframe(audit_action_summary_df, use_container_width=True, hide_index=True)
         if not audit_user_summary_df.empty:
             st.subheader("Audit Records by User")
-            st.dataframe(
-                audit_user_summary_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        top_audit = audit_action_summary_df.head(20).sort_values("Occurrences")
-        if not top_audit.empty:
-            audit_chart = px.bar(
-                top_audit,
-                x="Occurrences",
-                y="Action",
-                orientation="h",
-                color_discrete_sequence=["#5b9bd5"],
-            )
-            audit_chart = apply_graph_style(
-                audit_chart,
-                "Top Audit Actions by Frequency",
-                "Occurrences",
-                "Audit Action",
-            )
-            st.plotly_chart(audit_chart, use_container_width=True)
+            st.dataframe(audit_user_summary_df, use_container_width=True, hide_index=True)
 
 excel_file = build_excel(
     {
@@ -841,12 +779,8 @@ excel_file = build_excel(
         "Production Counters": production_df,
         "Fill Weight All": fill_df,
         "Fill Weight Passed": fill_pass_df,
-        "Safety Alarms": safety_df,
-        "Safety Summary": safety_summary_df,
-        "GMP Alarms": gmp_df,
-        "GMP Summary": gmp_summary_df,
-        "Equipment Alarms": equipment_df,
-        "Equipment Summary": equipment_summary_df,
+        "All Alarms": all_alarms_df,
+        "All Alarm Summary": all_alarm_summary_df,
         "Audit Trail": audit_df,
         "Audit Action Summary": audit_action_summary_df,
         "Audit User Summary": audit_user_summary_df,
