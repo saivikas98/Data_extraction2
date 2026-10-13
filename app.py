@@ -1,22 +1,23 @@
 import streamlit as st
 import pandas as pd
-import pymupdf as fitz
+import numpy as np
+import plotly.express as px
+import fitz
 import re
-
 from io import BytesIO
 
-# ==========================================================
+# =====================================================
 # PAGE CONFIG
-# ==========================================================
+# =====================================================
 
 st.set_page_config(
-    page_title="Batch Report Analyzer",
+    page_title="EG26058 Batch Report Analyzer",
     layout="wide"
 )
 
-# ==========================================================
+# =====================================================
 # PDF TEXT EXTRACTION
-# ==========================================================
+# =====================================================
 
 @st.cache_data
 def extract_pdf_text(pdf_bytes):
@@ -26,247 +27,284 @@ def extract_pdf_text(pdf_bytes):
         filetype="pdf"
     )
 
-    pages = []
-    full_text = ""
+    text = ""
 
-    for page_num, page in enumerate(doc):
+    for page in doc:
+        try:
+            text += page.get_text("text")
+            text += "\n"
+        except:
+            pass
 
-        text = page.get_text()
+    return text
 
-        pages.append(
-            {
-                "Page": page_num + 1,
-                "Text": text
-            }
+
+# =====================================================
+# BATCH SUMMARY
+# =====================================================
+
+def extract_batch_summary(text):
+
+    summary = {}
+
+    try:
+        m = re.search(
+            r'Batch No\.\s*:\s*(.*?)\s*Batch Start Time',
+            text,
+            re.DOTALL
         )
 
-        full_text += f"\n\n===== PAGE {page_num+1} =====\n\n"
-        full_text += text
+        summary["Batch Number"] = (
+            m.group(1).strip()
+            if m else ""
+        )
+    except:
+        summary["Batch Number"] = ""
 
-    return full_text, pages
+    try:
+        m = re.search(
+            r'Batch Start Time\s*:\s*(.*?)\s*Batch End Time',
+            text,
+            re.DOTALL
+        )
 
+        summary["Batch Start"] = (
+            m.group(1).strip()
+            if m else ""
+        )
+    except:
+        summary["Batch Start"] = ""
 
-# ==========================================================
-# SUMMARY
-# ==========================================================
+    try:
+        m = re.search(
+            r'Batch End Time\s*:\s*(.*?)\s*Batch Running Time',
+            text,
+            re.DOTALL
+        )
 
-def create_summary(text, pages):
+        summary["Batch End"] = (
+            m.group(1).strip()
+            if m else ""
+        )
+    except:
+        summary["Batch End"] = ""
 
-    return pd.DataFrame(
-        {
-            "Metric": [
-                "Pages",
-                "Characters",
-                "Lines"
-            ],
-            "Value": [
-                len(pages),
-                len(text),
-                len(text.splitlines())
-            ]
-        }
-    )
+    try:
+        m = re.search(
+            r'Batch Running Time.*?:\s*(.*?)\s*Batch Size',
+            text,
+            re.DOTALL
+        )
 
+        summary["Runtime"] = (
+            m.group(1).strip()
+            if m else ""
+        )
+    except:
+        summary["Runtime"] = ""
 
-# ==========================================================
-# FIND SECTIONS
-# ==========================================================
-
-def detect_sections(pages):
-
-    section_rows = []
-
-    keywords = {
-        "Fill Weight":
-            [
-                "net weight",
-                "gross weight",
-                "tare weight"
-            ],
-
-        "Safety Alarm":
-            [
-                "safety alarm"
-            ],
-
-        "GMP Alarm":
-            [
-                "gmp alarm"
-            ],
-
-        "Equipment Alarm":
-            [
-                "equipment alarm"
-            ],
-
-        "Audit Trail":
-            [
-                "audit trail"
-            ]
-    }
-
-    for page in pages:
-
-        page_no = page["Page"]
-
-        txt = page["Text"].lower()
-
-        for section, words in keywords.items():
-
-            if any(
-                word in txt
-                for word in words
-            ):
-
-                section_rows.append(
-                    {
-                        "Section": section,
-                        "Page": page_no
-                    }
-                )
-
-    return pd.DataFrame(section_rows)
+    return pd.DataFrame([summary])
 
 
-# ==========================================================
-# FILL WEIGHT PAGE EXTRACTOR
-# ==========================================================
+# =====================================================
+# PRODUCTION COUNTERS
+# =====================================================
 
-def extract_fill_weight_pages(pages):
+def extract_production_counters(text):
 
     rows = []
 
-    keywords = [
-        "net weight",
-        "gross weight",
-        "tare"
-    ]
+    for line in text.splitlines():
 
-    for page in pages:
+        nums = re.findall(r'\d+', line)
 
-        txt = page["Text"].lower()
-
-        if any(
-            k in txt
-            for k in keywords
+        if (
+            len(nums) >= 3 and
+            "counter" in line.lower()
         ):
 
             rows.append(
                 {
-                    "Page": page["Page"],
-                    "Content": page["Text"]
+                    "Raw Data": line
                 }
             )
 
     return pd.DataFrame(rows)
 
 
-# ==========================================================
+# =====================================================
+# FILL WEIGHT TABLE
+# =====================================================
+
+def extract_fill_weights(text):
+
+    rows = []
+
+    pattern = re.compile(
+        r'(\d{2}/\d{2}/\d{4})\s+'
+        r'(\d{2}:\d{2}:\d{2})\s+'
+        r'(-?\d+\.?\d*)\s+'
+        r'(-?\d+\.?\d*)\s+'
+        r'(-?\d+\.?\d*)\s+'
+        r'([01])\s+'
+        r'([01\-])\s+'
+        r'([01\-])\s+'
+        r'([01\-])\s+'
+        r'([1-4])'
+    )
+
+    for m in pattern.finditer(text):
+
+        rows.append(
+            {
+                "Timestamp":
+                    f"{m.group(1)} {m.group(2)}",
+
+                "Nett Weight":
+                    float(m.group(3)),
+
+                "Gross Weight":
+                    float(m.group(4)),
+
+                "Tare Weight":
+                    float(m.group(5)),
+
+                "Weight Passed":
+                    int(m.group(6)),
+
+                "Air Bubble":
+                    m.group(7),
+
+                "Needle Bonding":
+                    m.group(8),
+
+                "Assembly":
+                    m.group(9),
+
+                "Position":
+                    int(m.group(10))
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# =====================================================
 # SAFETY ALARMS
-# ==========================================================
+# =====================================================
 
-def extract_safety_alarms(pages):
+def extract_safety_alarms(text):
 
     rows = []
 
-    for page in pages:
+    section = text
 
-        txt = page["Text"]
+    pattern = re.compile(
+        r'(\d{2}/\d{2}/\d{4})\s+'
+        r'(\d{2}:\d{2}:\d{2})\s+'
+        r'([\+\-\*])\s+'
+        r'(.*?)\s+'
+        r'(\d+)$',
+        re.MULTILINE
+    )
 
-        if "safety" in txt.lower():
+    for m in pattern.finditer(section):
 
-            rows.append(
-                {
-                    "Page": page["Page"],
-                    "Alarm_Data": txt
-                }
-            )
+        rows.append(
+            {
+                "Timestamp":
+                    f"{m.group(1)} {m.group(2)}",
+
+                "State":
+                    m.group(3),
+
+                "Message":
+                    m.group(4),
+
+                "Code":
+                    m.group(5)
+            }
+        )
 
     return pd.DataFrame(rows)
 
 
-# ==========================================================
+# =====================================================
 # GMP ALARMS
-# ==========================================================
+# =====================================================
 
-def extract_gmp_alarms(pages):
+def extract_gmp_alarms(text):
 
     rows = []
 
-    for page in pages:
+    for line in text.splitlines():
 
-        txt = page["Text"]
-
-        if "gmp" in txt.lower():
+        if "gmp" in line.lower():
 
             rows.append(
                 {
-                    "Page": page["Page"],
-                    "Alarm_Data": txt
+                    "Alarm": line
                 }
             )
 
     return pd.DataFrame(rows)
 
 
-# ==========================================================
+# =====================================================
 # EQUIPMENT ALARMS
-# ==========================================================
+# =====================================================
 
-def extract_equipment_alarms(pages):
+def extract_equipment_alarms(text):
 
     rows = []
 
-    for page in pages:
+    for line in text.splitlines():
 
-        txt = page["Text"]
-
-        if "equipment" in txt.lower():
+        if "equipment" in line.lower():
 
             rows.append(
                 {
-                    "Page": page["Page"],
-                    "Alarm_Data": txt
+                    "Alarm": line
                 }
             )
 
     return pd.DataFrame(rows)
 
 
-# ==========================================================
+# =====================================================
 # AUDIT TRAIL
-# ==========================================================
+# =====================================================
 
-def extract_audit_trail(pages):
+def extract_audit_trail(text):
 
     rows = []
 
     collect = False
 
-    for page in pages:
+    for line in text.splitlines():
 
-        text = page["Text"]
-
-        if "audit trail" in text.lower():
+        if "audit trail" in line.lower():
             collect = True
 
         if collect:
 
-            rows.append(
-                {
-                    "Page": page["Page"],
-                    "Audit_Content": text
-                }
-            )
+            if len(line.strip()):
+
+                rows.append(
+                    {
+                        "Audit Record":
+                            line
+                    }
+                )
 
     return pd.DataFrame(rows)
 
 
-# ==========================================================
+# =====================================================
 # EXCEL EXPORT
-# ==========================================================
+# =====================================================
 
-def to_excel(dataframes):
+def build_excel(dfs):
 
     output = BytesIO()
 
@@ -275,13 +313,13 @@ def to_excel(dataframes):
         engine="openpyxl"
     ) as writer:
 
-        for name, df in dataframes.items():
+        for sheet, df in dfs.items():
 
             if not df.empty:
 
                 df.to_excel(
                     writer,
-                    sheet_name=name[:31],
+                    sheet_name=sheet[:31],
                     index=False
                 )
 
@@ -290,11 +328,11 @@ def to_excel(dataframes):
     return output
 
 
-# ==========================================================
-# MAIN APP
-# ==========================================================
+# =====================================================
+# UI
+# =====================================================
 
-st.title("PDF Batch Record Analyzer")
+st.title("EG26058 Batch Report Analyzer")
 
 uploaded_file = st.file_uploader(
     "Upload PDF",
@@ -303,72 +341,86 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file:
 
-    pdf_bytes = uploaded_file.read()
-
-    with st.spinner("Reading PDF..."):
-
-        full_text, pages = extract_pdf_text(
-            pdf_bytes
-        )
-
-        summary_df = create_summary(
-            full_text,
-            pages
-        )
-
-        section_df = detect_sections(
-            pages
-        )
-
-        fillweight_df = extract_fill_weight_pages(
-            pages
-        )
-
-        safety_df = extract_safety_alarms(
-            pages
-        )
-
-        gmp_df = extract_gmp_alarms(
-            pages
-        )
-
-        equipment_df = extract_equipment_alarms(
-            pages
-        )
-
-        audit_df = extract_audit_trail(
-            pages
-        )
-
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-        [
-            "Summary",
-            "Sections",
-            "Fill Weight",
-            "Safety",
-            "GMP",
-            "Equipment",
-            "Audit Trail"
-        ]
+    text = extract_pdf_text(
+        uploaded_file.read()
     )
 
+    summary_df = extract_batch_summary(text)
+
+    production_df = extract_production_counters(text)
+
+    fill_df = extract_fill_weights(text)
+
+    safety_df = extract_safety_alarms(text)
+
+    gmp_df = extract_gmp_alarms(text)
+
+    equipment_df = extract_equipment_alarms(text)
+
+    audit_df = extract_audit_trail(text)
+
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "Summary",
+        "Production",
+        "Fill Weight",
+        "Safety",
+        "GMP",
+        "Equipment",
+        "Audit"
+    ])
+
     with tab1:
-        st.dataframe(
-            summary_df,
-            use_container_width=True
-        )
+        st.dataframe(summary_df, use_container_width=True)
 
     with tab2:
+        st.dataframe(production_df, use_container_width=True)
+
+    with tab3:
+
         st.dataframe(
-            section_df,
+            fill_df,
             use_container_width=True
         )
 
-    with tab3:
-        st.dataframe(
-            fillweight_df,
-            use_container_width=True
-        )
+        if not fill_df.empty:
+
+            st.subheader("Weight Trend")
+
+            fig = px.line(
+                fill_df,
+                x="Timestamp",
+                y="Nett Weight",
+                color="Position"
+            )
+
+            st.plotly_chart(
+                fig,
+                use_container_width=True
+            )
+
+            st.subheader("Weight Distribution")
+
+            fig2 = px.histogram(
+                fill_df,
+                x="Nett Weight",
+                nbins=50
+            )
+
+            st.plotly_chart(
+                fig2,
+                use_container_width=True
+            )
+
+            pass_rate = (
+                fill_df["Weight Passed"]
+                .mean()
+                * 100
+            )
+
+            st.metric(
+                "Pass Rate %",
+                f"{pass_rate:.2f}"
+            )
 
     with tab4:
         st.dataframe(
@@ -394,15 +446,15 @@ if uploaded_file:
             use_container_width=True
         )
 
-    excel_file = to_excel(
+    excel_file = build_excel(
         {
             "Summary": summary_df,
-            "Sections": section_df,
-            "FillWeight": fillweight_df,
+            "Production": production_df,
+            "FillWeight": fill_df,
             "Safety": safety_df,
             "GMP": gmp_df,
             "Equipment": equipment_df,
-            "AuditTrail": audit_df,
+            "AuditTrail": audit_df
         }
     )
 
@@ -411,12 +463,4 @@ if uploaded_file:
         data=excel_file,
         file_name="Batch_Report_Analysis.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-    st.subheader("Raw PDF Text")
-
-    st.text_area(
-        "Extracted Content",
-        full_text[:50000],
-        height=400
     )
