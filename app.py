@@ -2,28 +2,28 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 
+from io import BytesIO
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
-from io import BytesIO
-
-import pytesseract
-import cv2
 from PIL import Image
 
-# ======================================================
+import cv2
+import pytesseract
+
+
+# ==========================================================
 # PAGE CONFIG
-# ======================================================
+# ==========================================================
 
 st.set_page_config(
     page_title="Batch Report Analyzer",
     layout="wide"
 )
 
-# ======================================================
+# ==========================================================
 # PDF TEXT EXTRACTION
-# ======================================================
+# ==========================================================
 
 def extract_pdf_text(pdf_file):
 
@@ -32,22 +32,21 @@ def extract_pdf_text(pdf_file):
     text = ""
 
     for page in reader.pages:
-
         try:
-            txt = page.extract_text()
+            page_text = page.extract_text()
 
-            if txt:
-                text += txt + "\n"
+            if page_text:
+                text += page_text + "\n"
 
-        except:
+        except Exception:
             pass
 
     return text
 
 
-# ======================================================
-# OCR PAGE EXTRACTION
-# ======================================================
+# ==========================================================
+# OCR TREND PAGE DETECTION
+# ==========================================================
 
 def extract_ocr_pages(pdf_bytes):
 
@@ -56,8 +55,6 @@ def extract_ocr_pages(pdf_bytes):
         dpi=300
     )
 
-    ocr_rows = []
-
     trend_keywords = [
         "weight",
         "pressure",
@@ -65,9 +62,12 @@ def extract_ocr_pages(pdf_bytes):
         "load cell"
     ]
 
+    ocr_rows = []
+
     for page_no, img in enumerate(images):
 
         try:
+
             text = pytesseract.image_to_string(img)
 
             if any(
@@ -78,19 +78,19 @@ def extract_ocr_pages(pdf_bytes):
                 ocr_rows.append(
                     {
                         "Page": page_no + 1,
-                        "OCR Text": text[:500]
+                        "OCR_Text": text[:1000]
                     }
                 )
 
-        except:
+        except Exception:
             pass
 
     return pd.DataFrame(ocr_rows), images
 
 
-# ======================================================
-# DIGITAL GRAPH EXTRACTION
-# ======================================================
+# ==========================================================
+# GRAPH DIGITIZATION
+# ==========================================================
 
 def detect_blue_curve(image):
 
@@ -99,8 +99,8 @@ def detect_blue_curve(image):
         cv2.COLOR_BGR2HSV
     )
 
-    lower = np.array([90,50,50])
-    upper = np.array([140,255,255])
+    lower = np.array([90, 50, 50])
+    upper = np.array([140, 255, 255])
 
     mask = cv2.inRange(
         hsv,
@@ -118,11 +118,11 @@ def detect_red_curve(image):
         cv2.COLOR_BGR2HSV
     )
 
-    lower1 = np.array([0,70,70])
-    upper1 = np.array([10,255,255])
+    lower1 = np.array([0, 70, 70])
+    upper1 = np.array([10, 255, 255])
 
-    lower2 = np.array([170,70,70])
-    upper2 = np.array([180,255,255])
+    lower2 = np.array([170, 70, 70])
+    upper2 = np.array([180, 255, 255])
 
     mask1 = cv2.inRange(
         hsv,
@@ -144,7 +144,6 @@ def extract_curve(mask):
     ys, xs = np.where(mask > 0)
 
     if len(xs) == 0:
-
         return pd.DataFrame()
 
     curve = pd.DataFrame(
@@ -164,27 +163,10 @@ def extract_curve(mask):
     return curve
 
 
-def convert_to_values(
-        curve,
-        ymin,
-        ymax,
-        img_height
-):
-
-    curve["Value"] = (
-        ymax -
-        (curve["y"]/img_height)
-        *
-        (ymax-ymin)
-    )
-
-    return curve
-
-
-def digitize_page(
-        pil_image,
-        ymin,
-        ymax
+def digitize_graph(
+    pil_image,
+    ymin,
+    ymax
 ):
 
     image = cv2.cvtColor(
@@ -196,51 +178,50 @@ def digitize_page(
 
     curve = extract_curve(mask)
 
-    if len(curve) == 0:
+    if curve.empty:
 
         mask = detect_red_curve(image)
 
         curve = extract_curve(mask)
 
-    if len(curve) == 0:
+    if curve.empty:
         return pd.DataFrame()
 
-    curve = convert_to_values(
-        curve,
-        ymin,
-        ymax,
-        image.shape[0]
+    height = image.shape[0]
+
+    curve["Value"] = (
+        ymax
+        - (curve["y"] / height)
+        * (ymax - ymin)
     )
 
     return curve
 
 
-# ======================================================
-# ALARM EXTRACTION
-# ======================================================
+# ==========================================================
+# SIMPLE ALARM EXTRACTION
+# ==========================================================
 
 def extract_alarm_rows(text):
 
-    rows = []
+    alarms = []
 
     for line in text.splitlines():
 
-        if ":" in line and "/" in line:
+        if "alarm" in line.lower():
 
-            if "alarm" in line.lower():
+            alarms.append(
+                {
+                    "Alarm_Record": line
+                }
+            )
 
-                rows.append(
-                    {
-                        "Alarm": line
-                    }
-                )
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame(alarms)
 
 
-# ======================================================
-# AUDIT EXTRACTION
-# ======================================================
+# ==========================================================
+# AUDIT TRAIL EXTRACTION
+# ==========================================================
 
 def extract_audit_rows(text):
 
@@ -256,24 +237,24 @@ def extract_audit_rows(text):
         if start:
             rows.append(
                 {
-                    "Audit": line
+                    "Audit_Record": line
                 }
             )
 
     return pd.DataFrame(rows)
 
 
-# ======================================================
+# ==========================================================
 # SUMMARY
-# ======================================================
+# ==========================================================
 
 def create_summary(text):
 
     return pd.DataFrame(
         {
             "Metric": [
-                "Total Characters",
-                "Total Lines"
+                "Characters",
+                "Lines"
             ],
             "Value": [
                 len(text),
@@ -283,11 +264,11 @@ def create_summary(text):
     )
 
 
-# ======================================================
+# ==========================================================
 # EXCEL EXPORT
-# ======================================================
+# ==========================================================
 
-def create_excel(data):
+def create_excel(data_dict):
 
     output = BytesIO()
 
@@ -296,13 +277,13 @@ def create_excel(data):
         engine="openpyxl"
     ) as writer:
 
-        for name, df in data.items():
+        for sheet_name, df in data_dict.items():
 
-            if len(df):
+            if not df.empty:
 
                 df.to_excel(
                     writer,
-                    sheet_name=name[:31],
+                    sheet_name=sheet_name[:31],
                     index=False
                 )
 
@@ -311,24 +292,22 @@ def create_excel(data):
     return output
 
 
-# ======================================================
-# UI
-# ======================================================
+# ==========================================================
+# MAIN APP
+# ==========================================================
 
-st.title("PDF Batch Report Analyzer")
+st.title("Batch Report Analyzer")
 
-uploaded = st.file_uploader(
-    "Upload Report",
+uploaded_file = st.file_uploader(
+    "Upload PDF",
     type=["pdf"]
 )
 
-if uploaded:
+if uploaded_file:
 
-    pdf_bytes = uploaded.read()
+    pdf_bytes = uploaded_file.read()
 
-    with st.spinner(
-        "Processing PDF..."
-    ):
+    with st.spinner("Processing PDF..."):
 
         text = extract_pdf_text(
             BytesIO(pdf_bytes)
@@ -344,77 +323,80 @@ if uploaded:
             pdf_bytes
         )
 
-    tabs = st.tabs(
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
         [
             "Summary",
             "OCR",
             "Alarms",
             "Audit",
-            "Digitizer"
+            "Graph Digitizer"
         ]
     )
 
-    with tabsst.dataframe(
+    with tab1:
+        st.dataframe(
             summary_df,
             use_container_width=True
         )
 
-    with tabsst.dataframe(
+    with tab2:
+        st.dataframe(
             ocr_df,
             use_container_width=True
         )
 
-    with tabsst.dataframe(
+    with tab3:
+        st.dataframe(
             alarm_df,
             use_container_width=True
         )
 
-    with tabsst.dataframe(
+    with tab4:
+        st.dataframe(
             audit_df,
             use_container_width=True
         )
 
-    with tabs[4]:
+    with tab5:
 
-        if len(images):
+        if len(images) > 0:
 
             page = st.selectbox(
-                "Graph Page",
+                "Select Page",
                 range(len(images)),
-                format_func=lambda x:
-                f"Page {x+1}"
+                format_func=lambda x: f"Page {x+1}"
             )
 
             ymin = st.number_input(
-                "Y Min",
+                "Y-Axis Minimum",
                 value=0.0
             )
 
             ymax = st.number_input(
-                "Y Max",
+                "Y-Axis Maximum",
                 value=100.0
             )
 
-            img = images[page]
+            image = images[page]
 
             st.image(
-                img,
+                image,
                 use_container_width=True
             )
 
-            curve = digitize_page(
-                img,
+            curve_df = digitize_graph(
+                image,
                 ymin,
                 ymax
             )
 
-            if len(curve):
+            if not curve_df.empty:
 
                 fig = px.line(
-                    curve,
+                    curve_df,
                     x="x",
                     y="Value",
-                    title="Digitized Trend"
+                    title="Digitized Trend Curve"
                 )
 
                 fig.update_layout(
@@ -426,34 +408,30 @@ if uploaded:
                     use_container_width=True
                 )
 
-                st.download_button(
-                    "Download CSV",
-                    curve.to_csv(
-                        index=False
-                    ),
-                    "digitized_curve.csv",
-                    "text/csv"
+                st.dataframe(
+                    curve_df,
+                    use_container_width=True
                 )
 
-    excel = create_excel(
+                st.download_button(
+                    "Download Curve CSV",
+                    curve_df.to_csv(index=False),
+                    file_name="digitized_curve.csv",
+                    mime="text/csv"
+                )
+
+    excel_file = create_excel(
         {
-            "Summary":
-                summary_df,
-
-            "OCR":
-                ocr_df,
-
-            "Alarms":
-                alarm_df,
-
-            "Audit":
-                audit_df
+            "Summary": summary_df,
+            "OCR": ocr_df,
+            "Alarms": alarm_df,
+            "Audit": audit_df
         }
     )
 
     st.download_button(
-        "Download Excel",
-        excel,
-        "Batch_Report_Analysis.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "Download Excel Report",
+        excel_file,
+        file_name="Batch_Report_Analysis.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
