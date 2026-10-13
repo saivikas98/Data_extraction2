@@ -65,7 +65,7 @@ def find_section_bounds(pages, include_terms, stop_terms=None):
 # PDF TEXT EXTRACTION
 # =====================================================
 @st.cache_data(show_spinner=False)
-def extract_pdf_pages(pdf_bytes, parser_version="2026-10-13-v4"):
+def extract_pdf_pages(pdf_bytes, parser_version="2026-10-13-v5"):
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
 
@@ -74,12 +74,35 @@ def extract_pdf_pages(pdf_bytes, parser_version="2026-10-13-v4"):
         raw_text = page.get_text("text", sort=False) or ""
         sorted_text = page.get_text("text", sort=True) or ""
         words = page.get_text("words", sort=True) or []
+
+        # Audit Trail pages contain a ruled six-column table. PyMuPDF table
+        # extraction preserves every row much more reliably than whole-page regex.
+        audit_rows = []
+        lower_text = raw_text.lower()
+        if (
+            "userid" in lower_text
+            and "description" in lower_text
+            and "category" in lower_text
+        ):
+            try:
+                table_finder = page.find_tables()
+                for table in table_finder.tables:
+                    extracted = table.extract() or []
+                    if not extracted:
+                        continue
+                    header = [normalize_space(cell) for cell in extracted[0]]
+                    if {"Timestamp", "State", "UserID", "Description", "Comment", "Category"}.issubset(set(header)):
+                        audit_rows.extend(extracted[1:])
+            except Exception:
+                audit_rows = []
+
         pages.append(
             {
                 "Page": page_number,
                 "Text": raw_text,
                 "Sorted Text": sorted_text,
                 "Words": words,
+                "Audit Rows": audit_rows,
             }
         )
 
@@ -484,79 +507,92 @@ def extract_equipment_alarms(pages):
 # AUDIT TRAIL EXTRACTION
 # =====================================================
 def extract_audit_trail(pages):
-    columns = ["Timestamp", "State", "User", "Action", "Audit Record"]
-    selected_pages = find_section_bounds(pages, ["audit trail"], [])
-    section_text = "\n".join(page["Text"] for page in selected_pages)
-
-    if not section_text:
-        return empty_dataframe(columns)
-
-    # Each audit event starts with date/time. The remainder is retained as a full
-    # action string because individual report versions can contain different fields.
-    event_pattern = re.compile(
-        r"(\d{2}/\d{2}/\d{4})\s+"
-        r"(\d{2}:\d{2}:\d{2})\s+"
-        r"([+*-])?\s*"
-        r"(.+?)"
-        r"(?=(?:\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})|$)",
-        flags=re.DOTALL,
-    )
-
+    columns = [
+        "Page",
+        "Timestamp",
+        "State",
+        "User",
+        "Description",
+        "Comment",
+        "Category",
+        "Action",
+        "Audit Record",
+    ]
     rows = []
-    for match in event_pattern.finditer(section_text):
-        record = normalize_space(match.group(4))
-        record = re.sub(
-            r"(?:Page\s+\d+\s+of\s+\d+|Audit\s*Trail)",
-            " ",
-            record,
-            flags=re.IGNORECASE,
-        )
-        record = normalize_space(record)
 
-        if not record or len(record) < 2:
-            continue
+    def clean_cell(value):
+        value = str(value or "").replace("\n", " ")
+        value = normalize_space(value)
+        # Remove isolated layout underscores introduced by PDF cell extraction.
+        value = re.sub(r"(?<!\w)_+(?!\w)", " ", value)
+        return normalize_space(value)
 
-        # Common audit layouts place the username first. If it cannot be isolated,
-        # the complete record is still preserved in Action and Audit Record.
-        user = ""
-        action = record
-        user_match = re.match(
-            r"(?:User\s*[:=-]\s*)?([A-Za-z][A-Za-z0-9_.@\\-]{1,40})\s+(.*)$",
-            record,
+    def normalize_audit_timestamp(value):
+        value = clean_cell(value)
+        # The narrow timestamp column wraps the hour, e.g.
+        # "02/08/2026 2\n2:32:01". After newline removal this becomes
+        # "02/08/2026 2 2:32:01" and must be rejoined to 22:32:01.
+        value = re.sub(
+            r"(\d{2}/\d{2}/\d{4})\s+(\d)\s+(\d:\d{2}:\d{2})",
+            r"\1 \2\3",
+            value,
         )
-        if user_match:
-            candidate_user = user_match.group(1)
-            candidate_action = user_match.group(2)
-            excluded_headers = {
-                "date",
-                "time",
-                "state",
-                "audit",
-                "page",
-                "event",
-                "message",
-                "description",
-            }
-            if candidate_user.lower() not in excluded_headers:
-                user = candidate_user
-                action = candidate_action
+        value = re.sub(
+            r"(\d{2}/\d{2}/\d{4})\s+(\d{2})\s+(\d:\d{2}:\d{2})",
+            r"\1 \2\3",
+            value,
+        )
+        match = re.search(
+            r"\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}",
+            value,
+        )
+        return match.group(0) if match else ""
 
-        rows.append(
-            {
-                "Timestamp": f"{match.group(1)} {match.group(2)}",
-                "State": match.group(3) or "",
-                "User": user,
-                "Action": action,
-                "Audit Record": record,
-            }
-        )
+    for page in pages:
+        page_number = page.get("Page", "")
+        for raw_row in page.get("Audit Rows", []) or []:
+            if not raw_row or len(raw_row) < 6:
+                continue
+            timestamp_text = normalize_audit_timestamp(raw_row[0])
+            if not timestamp_text:
+                continue
+
+            state = clean_cell(raw_row[1])
+            user = clean_cell(raw_row[2])
+            description = clean_cell(raw_row[3])
+            comment = clean_cell(raw_row[4])
+            category = clean_cell(raw_row[5])
+
+            # Category sometimes contains an alarm number such as "Alarm: 525".
+            # Preserve it exactly rather than discarding the field.
+            action = description
+            audit_record = " | ".join(
+                part
+                for part in [state, user, description, comment, category]
+                if part
+            )
+            rows.append(
+                {
+                    "Page": page_number,
+                    "Timestamp": timestamp_text,
+                    "State": state,
+                    "User": user,
+                    "Description": description,
+                    "Comment": comment,
+                    "Category": category,
+                    "Action": action,
+                    "Audit Record": audit_record,
+                }
+            )
 
     frame = pd.DataFrame(rows, columns=columns)
     if not frame.empty:
         frame["Timestamp"] = pd.to_datetime(
             frame["Timestamp"], dayfirst=True, errors="coerce"
         )
-        frame = frame.drop_duplicates().sort_values("Timestamp").reset_index(drop=True)
+        frame = frame.dropna(subset=["Timestamp"]).reset_index(drop=True)
+        # Do not drop duplicates. Some audit events genuinely repeat at the same
+        # second and every printed table row must be retained.
     return frame
 
 
@@ -1360,6 +1396,6 @@ with st.expander("Extraction diagnostics"):
                     na=False,
                 ).sum()
             ) if not all_alarms_df.empty else 0,
-            "Parser version": "2026-10-13-v4",
+            "Parser version": "2026-10-13-v5",
         }
     )
