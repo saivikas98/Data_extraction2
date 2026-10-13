@@ -136,57 +136,78 @@ def extract_batch_summary(text):
 # PRODUCTION COUNTERS
 # =====================================================
 def extract_production_counters(text, sorted_text=""):
-    columns = ["Counter", "Value"]
+    columns = ["Counter Group", "Counter", "Value"]
     combined = f"{text}\n{sorted_text}"
     rows = []
-    aliases = {
-        "Infeed": ["infeed", "in feed", "input"],
-        "Outfeed": ["outfeed", "out feed", "output"],
-        "Reject": ["reject", "rejected"],
-        "Accepted": ["accepted", "good units", "good products"],
-        "Produced": ["produced", "production quantity"],
-        "Total": ["total counter", "total produced"],
-    }
 
-    # Handles both "Infeed 1640" and vertical extraction "Infeed\n1640".
-    for canonical, names in aliases.items():
-        for name in names:
-            match = re.search(
-                rf"(?im)^\s*{re.escape(name)}\s*[:=\-]?\s*(?:\n\s*)?([0-9][0-9,]*)\s*$",
-                combined,
-            )
-            if match:
-                rows.append(
-                    {"Counter": canonical, "Value": int(match.group(1).replace(",", ""))}
-                )
-                break
+    # The report stores labels first and their values below them, for example:
+    # Infeed (pcs), Outfeed (pcs), Reject (pcs), followed by 1640, 1523, 117.
+    section_patterns = [
+        (
+            "Production Counters",
+            r"Production\s*Counters?\s*:\s*(.*?)\s*Check\s*Weigh\s*Reject\s*Counters?\s*:",
+            ["Infeed (pcs)", "Outfeed (pcs)", "Reject (pcs)"],
+        ),
+        (
+            "Check Weigh Reject Counters",
+            r"Check\s*Weigh\s*Reject\s*Counters?\s*:\s*(.*?)\s*Air\s*Bubble\s*Reject\s*Counters?\s*:",
+            ["Weigh Cell 1", "Weigh Cell 2", "Weigh Cell 3", "Weigh Cell 4", "Total"],
+        ),
+        (
+            "Air Bubble Reject Counters",
+            r"Air\s*Bubble\s*Reject\s*Counters?\s*:\s*(.*?)\s*Needle\s*Bonding\s*Reject\s*Counters?\s*:",
+            ["Position 1", "Position 2", "Position 3", "Position 4", "Total"],
+        ),
+        (
+            "Needle Bonding Reject Counters",
+            r"Needle\s*Bonding\s*Reject\s*Counters?\s*:\s*(.*?)\s*Assembly\s*Reject\s*Counters?\s*:",
+            ["Position 1", "Position 2", "Position 3", "Position 4", "Total"],
+        ),
+        (
+            "Assembly Reject Counters",
+            r"Assembly\s*Reject\s*Counters?\s*:\s*(.*?)\s*Filling\s*speed\s*:",
+            ["Position 1", "Position 2", "Position 3", "Position 4", "Total"],
+        ),
+    ]
 
-    # Fallback for a section where labels are followed by values on subsequent lines.
-    if not rows:
-        match = re.search(
-            r"Production\s*Counters?\s*:?(.*?)(?=Fill\s*Weight|Check\s*Weigh|Alarm|Audit|$)",
+    for group, pattern, expected_labels in section_patterns:
+        match = re.search(pattern, combined, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        section = match.group(1)
+        values = [int(x.replace(",", "")) for x in re.findall(r"(?m)^\s*(\d[\d,]*)\s*$", section)]
+        if len(values) >= len(expected_labels):
+            values = values[-len(expected_labels):]
+            for label, value in zip(expected_labels, values):
+                rows.append({"Counter Group": group, "Counter": label, "Value": value})
+
+    # Direct inline fallback for other report versions.
+    if not any(row["Counter Group"] == "Production Counters" for row in rows):
+        inline = re.search(
+            r"Infeed\s*(?:\(pcs\))?\s*[:=-]?\s*(\d+)\s+"
+            r"Outfeed\s*(?:\(pcs\))?\s*[:=-]?\s*(\d+)\s+"
+            r"Reject\s*(?:\(pcs\))?\s*[:=-]?\s*(\d+)",
             combined,
             flags=re.IGNORECASE | re.DOTALL,
         )
-        section = match.group(1) if match else ""
-        tokens = [normalize_space(x) for x in section.splitlines() if normalize_space(x)]
-        for i, token in enumerate(tokens):
-            for canonical, names in aliases.items():
-                if token.lower() in names:
-                    for next_token in tokens[i + 1 : i + 4]:
-                        number = re.fullmatch(r"[0-9][0-9,]*", next_token)
-                        if number:
-                            rows.append(
-                                {
-                                    "Counter": canonical,
-                                    "Value": int(next_token.replace(",", "")),
-                                }
-                            )
-                            break
+        if inline:
+            for label, value in zip(
+                ["Infeed (pcs)", "Outfeed (pcs)", "Reject (pcs)"],
+                inline.groups(),
+            ):
+                rows.append(
+                    {
+                        "Counter Group": "Production Counters",
+                        "Counter": label,
+                        "Value": int(value),
+                    }
+                )
 
     frame = pd.DataFrame(rows, columns=columns)
     if not frame.empty:
-        frame = frame.drop_duplicates(subset=["Counter"], keep="first").reset_index(drop=True)
+        frame = frame.drop_duplicates(
+            subset=["Counter Group", "Counter"], keep="first"
+        ).reset_index(drop=True)
     return frame
 
 
@@ -780,6 +801,47 @@ with production_tab:
         st.warning("Production counter labels or values were not recognized. See Extraction diagnostics for the detected page text.")
     else:
         st.dataframe(production_df, use_container_width=True, hide_index=True)
+        production_group = st.selectbox(
+            "Counter group to plot",
+            options=production_df["Counter Group"].drop_duplicates().tolist(),
+        )
+        production_plot_df = production_df[
+            production_df["Counter Group"].eq(production_group)
+        ]
+        production_fig = px.bar(
+            production_plot_df,
+            x="Counter",
+            y="Value",
+            color="Counter",
+            text="Value",
+            title=production_group,
+        )
+        production_fig.update_traces(textposition="outside")
+        production_fig = apply_graph_style(
+            production_fig,
+            production_group,
+            "Counter",
+            "Value",
+        )
+        production_fig = make_interactive(
+            production_fig,
+            show_x_grid=show_x_grid,
+            show_y_grid=show_y_grid,
+            show_range_slider=False,
+        )
+        st.plotly_chart(
+            production_fig,
+            use_container_width=True,
+            config=PLOTLY_CONFIG,
+            key="interactive_production_counters",
+        )
+        st.download_button(
+            "Download Interactive Production Counter Chart (HTML)",
+            data=figure_to_html_bytes(production_fig),
+            file_name=f"{batch_label}_production_counters.html",
+            mime="text/html",
+            use_container_width=True,
+        )
 
 with fill_tab:
     st.subheader("Fill Weight Passed Records")
@@ -914,6 +976,75 @@ with alarms_tab:
                 use_container_width=True,
             )
 
+        if not filtered_alarms.empty:
+            st.subheader("Alarm Events by Category")
+            category_counts = (
+                filtered_alarms.groupby("Alarm Type")
+                .size()
+                .reset_index(name="Occurrences")
+            )
+            category_fig = px.bar(
+                category_counts,
+                x="Alarm Type",
+                y="Occurrences",
+                color="Alarm Type",
+                text="Occurrences",
+            )
+            category_fig.update_traces(textposition="outside")
+            category_fig = apply_graph_style(
+                category_fig,
+                "Alarm Events by Category",
+                "Alarm Category",
+                "Occurrences",
+            )
+            category_fig = make_interactive(
+                category_fig,
+                show_x_grid=show_x_grid,
+                show_y_grid=show_y_grid,
+                show_range_slider=False,
+            )
+            st.plotly_chart(
+                category_fig,
+                use_container_width=True,
+                config=PLOTLY_CONFIG,
+                key="interactive_alarm_category",
+            )
+
+            st.subheader("Alarm Timeline")
+            timeline_df = filtered_alarms.dropna(subset=["Timestamp"]).copy()
+            if not timeline_df.empty:
+                timeline_df["Hour"] = timeline_df["Timestamp"].dt.floor("h")
+                timeline_counts = (
+                    timeline_df.groupby(["Hour", "Alarm Type"])
+                    .size()
+                    .reset_index(name="Occurrences")
+                )
+                timeline_fig = px.line(
+                    timeline_counts,
+                    x="Hour",
+                    y="Occurrences",
+                    color="Alarm Type",
+                    markers=True,
+                )
+                timeline_fig = apply_graph_style(
+                    timeline_fig,
+                    "Alarm Events Over Time",
+                    "Time",
+                    "Occurrences",
+                )
+                timeline_fig = make_interactive(
+                    timeline_fig,
+                    show_x_grid=show_x_grid,
+                    show_y_grid=show_y_grid,
+                    show_range_slider=show_range_slider,
+                )
+                st.plotly_chart(
+                    timeline_fig,
+                    use_container_width=True,
+                    config=PLOTLY_CONFIG,
+                    key="interactive_alarm_timeline",
+                )
+
 with audit_tab:
     st.subheader("Audit Trail Table")
     if audit_df.empty:
@@ -929,6 +1060,67 @@ with audit_tab:
         if not audit_user_summary_df.empty:
             st.subheader("Audit Records by User")
             st.dataframe(audit_user_summary_df, use_container_width=True, hide_index=True)
+            audit_user_fig = px.bar(
+                audit_user_summary_df.head(20),
+                x="User",
+                y="Occurrences",
+                color="User",
+                text="Occurrences",
+            )
+            audit_user_fig.update_traces(textposition="outside")
+            audit_user_fig = apply_graph_style(
+                audit_user_fig,
+                "Audit Records by User",
+                "User",
+                "Occurrences",
+            )
+            audit_user_fig = make_interactive(
+                audit_user_fig,
+                show_x_grid=show_x_grid,
+                show_y_grid=show_y_grid,
+                show_range_slider=False,
+            )
+            st.plotly_chart(
+                audit_user_fig,
+                use_container_width=True,
+                config=PLOTLY_CONFIG,
+                key="interactive_audit_users",
+            )
+
+        top_audit_actions = audit_action_summary_df.head(20).sort_values("Occurrences")
+        if not top_audit_actions.empty:
+            audit_action_fig = px.bar(
+                top_audit_actions,
+                x="Occurrences",
+                y="Action",
+                orientation="h",
+                color_discrete_sequence=["#5b9bd5"],
+            )
+            audit_action_fig = apply_graph_style(
+                audit_action_fig,
+                "Top Audit Actions by Frequency",
+                "Occurrences",
+                "Audit Action",
+            )
+            audit_action_fig = make_interactive(
+                audit_action_fig,
+                show_x_grid=show_x_grid,
+                show_y_grid=show_y_grid,
+                show_range_slider=False,
+            )
+            st.plotly_chart(
+                audit_action_fig,
+                use_container_width=True,
+                config=PLOTLY_CONFIG,
+                key="interactive_audit_actions",
+            )
+            st.download_button(
+                "Download Interactive Audit Action Chart (HTML)",
+                data=figure_to_html_bytes(audit_action_fig),
+                file_name=f"{batch_label}_audit_actions.html",
+                mime="text/html",
+                use_container_width=True,
+            )
 
 excel_file = build_excel(
     {
