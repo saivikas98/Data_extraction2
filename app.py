@@ -619,6 +619,67 @@ def build_excel(dataframes):
 
 
 # =====================================================
+# INTERACTIVE PLOT CONFIGURATION
+# =====================================================
+PLOTLY_CONFIG = {
+    "displaylogo": False,
+    "scrollZoom": True,
+    "displayModeBar": True,
+    "modeBarButtonsToAdd": [
+        "drawline",
+        "drawopenpath",
+        "drawrect",
+        "drawcircle",
+        "eraseshape",
+        "toggleSpikelines",
+    ],
+    "toImageButtonOptions": {
+        "format": "png",
+        "filename": "interactive_graph",
+        "height": 700,
+        "width": 1400,
+        "scale": 2,
+    },
+}
+
+
+def make_interactive(fig, show_x_grid=True, show_y_grid=True, show_range_slider=False):
+    fig.update_layout(
+        dragmode="zoom",
+        hovermode="closest",
+        clickmode="event+select",
+        selectdirection="any",
+        uirevision="keep-user-zoom",
+        editable=True,
+        newshape=dict(line_color="#c00000", line_width=2),
+    )
+    fig.update_xaxes(
+        showgrid=show_x_grid,
+        rangeslider=dict(visible=show_range_slider),
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikedash="dot",
+    )
+    fig.update_yaxes(
+        showgrid=show_y_grid,
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikedash="dot",
+    )
+    return fig
+
+
+def figure_to_html_bytes(fig):
+    return fig.to_html(
+        full_html=True,
+        include_plotlyjs=True,
+        config=PLOTLY_CONFIG,
+    ).encode("utf-8")
+
+
+# =====================================================
 # STREAMLIT UI
 # =====================================================
 st.title("Batch Report Analyzer")
@@ -670,6 +731,12 @@ st.sidebar.header("Fill Weight Graph Settings")
 lower_limit = st.sidebar.number_input("Lower fill-weight limit", value=526.0)
 upper_limit = st.sidebar.number_input("Upper fill-weight limit", value=540.0)
 histogram_bins = st.sidebar.slider("Histogram bins", min_value=5, max_value=60, value=20)
+st.sidebar.subheader("Interactive Graph Controls")
+show_x_grid = st.sidebar.checkbox("Show X-axis gridlines", value=True)
+show_y_grid = st.sidebar.checkbox("Show Y-axis gridlines", value=True)
+show_range_slider = st.sidebar.checkbox("Show X-axis range slider", value=True)
+marker_size = st.sidebar.slider("Scatter marker size", 3, 16, 7)
+marker_opacity = st.sidebar.slider("Scatter marker opacity", 0.2, 1.0, 0.82, 0.02)
 
 if lower_limit >= upper_limit:
     st.sidebar.error("Lower limit must be less than upper limit.")
@@ -729,8 +796,75 @@ with fill_tab:
         shown = fill_pass_df if table_choice == "Passed only" else fill_df
         st.dataframe(shown, use_container_width=True, hide_index=True)
         if not fill_pass_df.empty and lower_limit < upper_limit:
-            st.plotly_chart(make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit), use_container_width=True)
-            st.plotly_chart(make_fill_histogram(fill_pass_df, batch_label, histogram_bins), use_container_width=True)
+            st.caption(
+                "Use the Plotly toolbar to zoom, pan, box-select, lasso-select, draw annotations, "
+                "reset axes, and download a PNG. Double-click the chart to reset the view."
+            )
+
+            available_positions = sorted(fill_pass_df["Position"].dropna().unique().tolist())
+            selected_positions = st.multiselect(
+                "Positions to display",
+                options=available_positions,
+                default=available_positions,
+            )
+            graph_df = fill_pass_df[fill_pass_df["Position"].isin(selected_positions)].copy()
+
+            if graph_df.empty:
+                st.warning("Select at least one filling position to display the graphs.")
+            else:
+                scatter_figure = make_fill_scatter(
+                    graph_df,
+                    batch_label,
+                    lower_limit,
+                    upper_limit,
+                )
+                scatter_figure.update_traces(
+                    marker=dict(size=marker_size, opacity=marker_opacity)
+                )
+                scatter_figure = make_interactive(
+                    scatter_figure,
+                    show_x_grid=show_x_grid,
+                    show_y_grid=show_y_grid,
+                    show_range_slider=show_range_slider,
+                )
+                st.plotly_chart(
+                    scatter_figure,
+                    use_container_width=True,
+                    config=PLOTLY_CONFIG,
+                    key="interactive_fill_scatter",
+                )
+                st.download_button(
+                    "Download Interactive Fill-Weight Graph (HTML)",
+                    data=figure_to_html_bytes(scatter_figure),
+                    file_name=f"{batch_label}_interactive_fill_weight.html",
+                    mime="text/html",
+                    use_container_width=True,
+                )
+
+                histogram_figure = make_fill_histogram(
+                    graph_df,
+                    batch_label,
+                    histogram_bins,
+                )
+                histogram_figure = make_interactive(
+                    histogram_figure,
+                    show_x_grid=show_x_grid,
+                    show_y_grid=show_y_grid,
+                    show_range_slider=False,
+                )
+                st.plotly_chart(
+                    histogram_figure,
+                    use_container_width=True,
+                    config=PLOTLY_CONFIG,
+                    key="interactive_fill_histogram",
+                )
+                st.download_button(
+                    "Download Interactive Histogram (HTML)",
+                    data=figure_to_html_bytes(histogram_figure),
+                    file_name=f"{batch_label}_interactive_histogram.html",
+                    mime="text/html",
+                    use_container_width=True,
+                )
 
 with alarms_tab:
     st.subheader("Combined Alarm Table")
@@ -755,7 +889,31 @@ with alarms_tab:
         top_alarm = filtered_summary.head(20).sort_values("Occurrences")
         if not top_alarm.empty:
             fig_alarm = px.bar(top_alarm, x="Occurrences", y="Message", orientation="h", color_discrete_sequence=["#d9534f"], hover_data=["Code"])
-            st.plotly_chart(apply_graph_style(fig_alarm, "Top Alarms by Frequency", "Occurrences", "Alarm Message"), use_container_width=True)
+            fig_alarm = apply_graph_style(
+                fig_alarm,
+                "Top Alarms by Frequency",
+                "Occurrences",
+                "Alarm Message",
+            )
+            fig_alarm = make_interactive(
+                fig_alarm,
+                show_x_grid=show_x_grid,
+                show_y_grid=show_y_grid,
+                show_range_slider=False,
+            )
+            st.plotly_chart(
+                fig_alarm,
+                use_container_width=True,
+                config=PLOTLY_CONFIG,
+                key="interactive_alarm_pareto",
+            )
+            st.download_button(
+                "Download Interactive Alarm Chart (HTML)",
+                data=figure_to_html_bytes(fig_alarm),
+                file_name=f"{batch_label}_interactive_alarm_pareto.html",
+                mime="text/html",
+                use_container_width=True,
+            )
 
 with audit_tab:
     st.subheader("Audit Trail Table")
