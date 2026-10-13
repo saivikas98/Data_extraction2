@@ -1,16 +1,9 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import plotly.express as px
+import fitz
+import re
 
 from io import BytesIO
-from pypdf import PdfReader
-from pdf2image import convert_from_bytes
-from PIL import Image
-
-import cv2
-import pytesseract
-
 
 # ==========================================================
 # PAGE CONFIG
@@ -25,238 +18,49 @@ st.set_page_config(
 # PDF TEXT EXTRACTION
 # ==========================================================
 
-def extract_pdf_text(pdf_file):
+@st.cache_data
+def extract_pdf_text(pdf_bytes):
 
-    reader = PdfReader(pdf_file)
-
-    text = ""
-
-    for page in reader.pages:
-        try:
-            page_text = page.extract_text()
-
-            if page_text:
-                text += page_text + "\n"
-
-        except Exception:
-            pass
-
-    return text
-
-
-# ==========================================================
-# OCR TREND PAGE DETECTION
-# ==========================================================
-
-def extract_ocr_pages(pdf_bytes):
-
-    images = convert_from_bytes(
-        pdf_bytes,
-        dpi=300
+    doc = fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf"
     )
 
-    trend_keywords = [
-        "weight",
-        "pressure",
-        "temperature",
-        "load cell"
-    ]
+    pages = []
+    full_text = ""
 
-    ocr_rows = []
+    for page_num, page in enumerate(doc):
 
-    for page_no, img in enumerate(images):
+        text = page.get_text()
 
-        try:
+        pages.append(
+            {
+                "Page": page_num + 1,
+                "Text": text
+            }
+        )
 
-            text = pytesseract.image_to_string(img)
+        full_text += f"\n\n===== PAGE {page_num+1} =====\n\n"
+        full_text += text
 
-            if any(
-                k in text.lower()
-                for k in trend_keywords
-            ):
-
-                ocr_rows.append(
-                    {
-                        "Page": page_no + 1,
-                        "OCR_Text": text[:1000]
-                    }
-                )
-
-        except Exception:
-            pass
-
-    return pd.DataFrame(ocr_rows), images
-
-
-# ==========================================================
-# GRAPH DIGITIZATION
-# ==========================================================
-
-def detect_blue_curve(image):
-
-    hsv = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2HSV
-    )
-
-    lower = np.array([90, 50, 50])
-    upper = np.array([140, 255, 255])
-
-    mask = cv2.inRange(
-        hsv,
-        lower,
-        upper
-    )
-
-    return mask
-
-
-def detect_red_curve(image):
-
-    hsv = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2HSV
-    )
-
-    lower1 = np.array([0, 70, 70])
-    upper1 = np.array([10, 255, 255])
-
-    lower2 = np.array([170, 70, 70])
-    upper2 = np.array([180, 255, 255])
-
-    mask1 = cv2.inRange(
-        hsv,
-        lower1,
-        upper1
-    )
-
-    mask2 = cv2.inRange(
-        hsv,
-        lower2,
-        upper2
-    )
-
-    return mask1 + mask2
-
-
-def extract_curve(mask):
-
-    ys, xs = np.where(mask > 0)
-
-    if len(xs) == 0:
-        return pd.DataFrame()
-
-    curve = pd.DataFrame(
-        {
-            "x": xs,
-            "y": ys
-        }
-    )
-
-    curve = (
-        curve
-        .groupby("x")
-        .mean()
-        .reset_index()
-    )
-
-    return curve
-
-
-def digitize_graph(
-    pil_image,
-    ymin,
-    ymax
-):
-
-    image = cv2.cvtColor(
-        np.array(pil_image),
-        cv2.COLOR_RGB2BGR
-    )
-
-    mask = detect_blue_curve(image)
-
-    curve = extract_curve(mask)
-
-    if curve.empty:
-
-        mask = detect_red_curve(image)
-
-        curve = extract_curve(mask)
-
-    if curve.empty:
-        return pd.DataFrame()
-
-    height = image.shape[0]
-
-    curve["Value"] = (
-        ymax
-        - (curve["y"] / height)
-        * (ymax - ymin)
-    )
-
-    return curve
-
-
-# ==========================================================
-# SIMPLE ALARM EXTRACTION
-# ==========================================================
-
-def extract_alarm_rows(text):
-
-    alarms = []
-
-    for line in text.splitlines():
-
-        if "alarm" in line.lower():
-
-            alarms.append(
-                {
-                    "Alarm_Record": line
-                }
-            )
-
-    return pd.DataFrame(alarms)
-
-
-# ==========================================================
-# AUDIT TRAIL EXTRACTION
-# ==========================================================
-
-def extract_audit_rows(text):
-
-    rows = []
-
-    start = False
-
-    for line in text.splitlines():
-
-        if "audit" in line.lower():
-            start = True
-
-        if start:
-            rows.append(
-                {
-                    "Audit_Record": line
-                }
-            )
-
-    return pd.DataFrame(rows)
+    return full_text, pages
 
 
 # ==========================================================
 # SUMMARY
 # ==========================================================
 
-def create_summary(text):
+def create_summary(text, pages):
 
     return pd.DataFrame(
         {
             "Metric": [
+                "Pages",
                 "Characters",
                 "Lines"
             ],
             "Value": [
+                len(pages),
                 len(text),
                 len(text.splitlines())
             ]
@@ -265,10 +69,204 @@ def create_summary(text):
 
 
 # ==========================================================
+# FIND SECTIONS
+# ==========================================================
+
+def detect_sections(pages):
+
+    section_rows = []
+
+    keywords = {
+        "Fill Weight":
+            [
+                "net weight",
+                "gross weight",
+                "tare weight"
+            ],
+
+        "Safety Alarm":
+            [
+                "safety alarm"
+            ],
+
+        "GMP Alarm":
+            [
+                "gmp alarm"
+            ],
+
+        "Equipment Alarm":
+            [
+                "equipment alarm"
+            ],
+
+        "Audit Trail":
+            [
+                "audit trail"
+            ]
+    }
+
+    for page in pages:
+
+        page_no = page["Page"]
+
+        txt = page["Text"].lower()
+
+        for section, words in keywords.items():
+
+            if any(
+                word in txt
+                for word in words
+            ):
+
+                section_rows.append(
+                    {
+                        "Section": section,
+                        "Page": page_no
+                    }
+                )
+
+    return pd.DataFrame(section_rows)
+
+
+# ==========================================================
+# FILL WEIGHT PAGE EXTRACTOR
+# ==========================================================
+
+def extract_fill_weight_pages(pages):
+
+    rows = []
+
+    keywords = [
+        "net weight",
+        "gross weight",
+        "tare"
+    ]
+
+    for page in pages:
+
+        txt = page["Text"].lower()
+
+        if any(
+            k in txt
+            for k in keywords
+        ):
+
+            rows.append(
+                {
+                    "Page": page["Page"],
+                    "Content": page["Text"]
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+# ==========================================================
+# SAFETY ALARMS
+# ==========================================================
+
+def extract_safety_alarms(pages):
+
+    rows = []
+
+    for page in pages:
+
+        txt = page["Text"]
+
+        if "safety" in txt.lower():
+
+            rows.append(
+                {
+                    "Page": page["Page"],
+                    "Alarm_Data": txt
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+# ==========================================================
+# GMP ALARMS
+# ==========================================================
+
+def extract_gmp_alarms(pages):
+
+    rows = []
+
+    for page in pages:
+
+        txt = page["Text"]
+
+        if "gmp" in txt.lower():
+
+            rows.append(
+                {
+                    "Page": page["Page"],
+                    "Alarm_Data": txt
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+# ==========================================================
+# EQUIPMENT ALARMS
+# ==========================================================
+
+def extract_equipment_alarms(pages):
+
+    rows = []
+
+    for page in pages:
+
+        txt = page["Text"]
+
+        if "equipment" in txt.lower():
+
+            rows.append(
+                {
+                    "Page": page["Page"],
+                    "Alarm_Data": txt
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+# ==========================================================
+# AUDIT TRAIL
+# ==========================================================
+
+def extract_audit_trail(pages):
+
+    rows = []
+
+    collect = False
+
+    for page in pages:
+
+        text = page["Text"]
+
+        if "audit trail" in text.lower():
+            collect = True
+
+        if collect:
+
+            rows.append(
+                {
+                    "Page": page["Page"],
+                    "Audit_Content": text
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+# ==========================================================
 # EXCEL EXPORT
 # ==========================================================
 
-def create_excel(data_dict):
+def to_excel(dataframes):
 
     output = BytesIO()
 
@@ -277,13 +275,13 @@ def create_excel(data_dict):
         engine="openpyxl"
     ) as writer:
 
-        for sheet_name, df in data_dict.items():
+        for name, df in dataframes.items():
 
             if not df.empty:
 
                 df.to_excel(
                     writer,
-                    sheet_name=sheet_name[:31],
+                    sheet_name=name[:31],
                     index=False
                 )
 
@@ -296,7 +294,7 @@ def create_excel(data_dict):
 # MAIN APP
 # ==========================================================
 
-st.title("Batch Report Analyzer")
+st.title("PDF Batch Record Analyzer")
 
 uploaded_file = st.file_uploader(
     "Upload PDF",
@@ -307,29 +305,50 @@ if uploaded_file:
 
     pdf_bytes = uploaded_file.read()
 
-    with st.spinner("Processing PDF..."):
+    with st.spinner("Reading PDF..."):
 
-        text = extract_pdf_text(
-            BytesIO(pdf_bytes)
-        )
-
-        summary_df = create_summary(text)
-
-        alarm_df = extract_alarm_rows(text)
-
-        audit_df = extract_audit_rows(text)
-
-        ocr_df, images = extract_ocr_pages(
+        full_text, pages = extract_pdf_text(
             pdf_bytes
         )
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        summary_df = create_summary(
+            full_text,
+            pages
+        )
+
+        section_df = detect_sections(
+            pages
+        )
+
+        fillweight_df = extract_fill_weight_pages(
+            pages
+        )
+
+        safety_df = extract_safety_alarms(
+            pages
+        )
+
+        gmp_df = extract_gmp_alarms(
+            pages
+        )
+
+        equipment_df = extract_equipment_alarms(
+            pages
+        )
+
+        audit_df = extract_audit_trail(
+            pages
+        )
+
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         [
             "Summary",
-            "OCR",
-            "Alarms",
-            "Audit",
-            "Graph Digitizer"
+            "Sections",
+            "Fill Weight",
+            "Safety",
+            "GMP",
+            "Equipment",
+            "Audit Trail"
         ]
     )
 
@@ -341,97 +360,63 @@ if uploaded_file:
 
     with tab2:
         st.dataframe(
-            ocr_df,
+            section_df,
             use_container_width=True
         )
 
     with tab3:
         st.dataframe(
-            alarm_df,
+            fillweight_df,
             use_container_width=True
         )
 
     with tab4:
         st.dataframe(
-            audit_df,
+            safety_df,
             use_container_width=True
         )
 
     with tab5:
+        st.dataframe(
+            gmp_df,
+            use_container_width=True
+        )
 
-        if len(images) > 0:
+    with tab6:
+        st.dataframe(
+            equipment_df,
+            use_container_width=True
+        )
 
-            page = st.selectbox(
-                "Select Page",
-                range(len(images)),
-                format_func=lambda x: f"Page {x+1}"
-            )
+    with tab7:
+        st.dataframe(
+            audit_df,
+            use_container_width=True
+        )
 
-            ymin = st.number_input(
-                "Y-Axis Minimum",
-                value=0.0
-            )
-
-            ymax = st.number_input(
-                "Y-Axis Maximum",
-                value=100.0
-            )
-
-            image = images[page]
-
-            st.image(
-                image,
-                use_container_width=True
-            )
-
-            curve_df = digitize_graph(
-                image,
-                ymin,
-                ymax
-            )
-
-            if not curve_df.empty:
-
-                fig = px.line(
-                    curve_df,
-                    x="x",
-                    y="Value",
-                    title="Digitized Trend Curve"
-                )
-
-                fig.update_layout(
-                    hovermode="x unified"
-                )
-
-                st.plotly_chart(
-                    fig,
-                    use_container_width=True
-                )
-
-                st.dataframe(
-                    curve_df,
-                    use_container_width=True
-                )
-
-                st.download_button(
-                    "Download Curve CSV",
-                    curve_df.to_csv(index=False),
-                    file_name="digitized_curve.csv",
-                    mime="text/csv"
-                )
-
-    excel_file = create_excel(
+    excel_file = to_excel(
         {
             "Summary": summary_df,
-            "OCR": ocr_df,
-            "Alarms": alarm_df,
-            "Audit": audit_df
+            "Sections": section_df,
+            "FillWeight": fillweight_df,
+            "Safety": safety_df,
+            "GMP": gmp_df,
+            "Equipment": equipment_df,
+            "AuditTrail": audit_df,
         }
     )
 
     st.download_button(
-        "Download Excel Report",
-        excel_file,
+        "Download Excel",
+        data=excel_file,
         file_name="Batch_Report_Analysis.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    st.subheader("Raw PDF Text")
+
+    st.text_area(
+        "Extracted Content",
+        full_text[:50000],
+        height=400
     )
