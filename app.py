@@ -65,7 +65,7 @@ def find_section_bounds(pages, include_terms, stop_terms=None):
 # PDF TEXT EXTRACTION
 # =====================================================
 @st.cache_data(show_spinner=False)
-def extract_pdf_pages(pdf_bytes):
+def extract_pdf_pages(pdf_bytes, parser_version="2026-10-13-v4"):
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
 
@@ -330,6 +330,13 @@ def clean_alarm_chunk(text):
     """Remove repeating column headers and page footers before parsing alarms."""
     # The footer begins with Batch Number on every alarm page. Anything after that
     # is report metadata and must never become part of an alarm message.
+    # Alarm data must end before the legend or Audit Trail, even when both
+    # sections occur on the same PDF page as the final alarm record.
+    text = re.split(
+        r"(?im)^\s*(?:Alarm\s+State\s+Legend|Audit\s+Trail)\s*$",
+        text,
+        maxsplit=1,
+    )[0]
     text = re.split(r"(?im)^\s*Batch\s+Number\s*:", text, maxsplit=1)[0]
     text = re.sub(r"(?im)^\s*(Timestamp|State|MsgText|Code)\s*$", "", text)
     text = re.sub(r"(?im)^\s*Page\s+\d+\s+of\s+\d+\s*$", "", text)
@@ -409,6 +416,17 @@ def extract_alarm_tables(pages):
             r"(?im)^\s*Batch\s+Number\s*:", page_text, maxsplit=1
         )[0]
 
+        # A page can contain the final alarm, the Alarm State Legend and the
+        # beginning of Audit Trail. Truncate before the legend/audit header so
+        # audit descriptions can never be appended to the final alarm message.
+        boundary = re.search(
+            r"(?im)^\s*(?:Alarm\s+State\s+Legend|Audit\s+Trail)\s*$",
+            page_text,
+        )
+        reached_audit_boundary = boundary is not None
+        if boundary:
+            page_text = page_text[: boundary.start()]
+
         # A page can contain the end of one category and the beginning of another.
         header_hits = []
         for category, header_pattern in category_aliases:
@@ -425,8 +443,8 @@ def extract_alarm_tables(pages):
         if current_category and cursor < len(page_text):
             chunks[current_category].append(page_text[cursor:])
 
-        # Stop carrying alarm state when the audit section begins.
-        if re.search(r"(?im)^\s*Audit\s+Trail\s*$", page_text):
+        # Stop carrying alarm state after the legend/audit boundary.
+        if reached_audit_boundary:
             current_category = None
 
     outputs = {}
@@ -540,6 +558,42 @@ def extract_audit_trail(pages):
         )
         frame = frame.drop_duplicates().sort_values("Timestamp").reset_index(drop=True)
     return frame
+
+
+# =====================================================
+# FINAL ALARM MESSAGE SANITIZATION
+# =====================================================
+def sanitize_alarm_messages(alarm_df):
+    """Final guard against legend, audit-trail, and footer text entering alarms."""
+    if alarm_df is None or alarm_df.empty:
+        return alarm_df
+
+    cleaned = alarm_df.copy()
+    stop_pattern = re.compile(
+        r"\s*(?:"
+        r"Alarm\s+State\s+Legend|"
+        r"Audit\s+Trail|"
+        r"UserID\s+Description\s+Comment\s+Category|"
+        r"Timestamp\s+State\s+UserID|"
+        r"\+\s+Incoming\s+Alarm|"
+        r"-\s+Outgoing\s+Alarm|"
+        r"\*\s+Acknowledge\s+Alarm|"
+        r"Batch\s+Number\s*:|"
+        r"Product\s+Name\s*:|"
+        r"Report\s+Generated\s*:|"
+        r"Printed\s+by\s*:|"
+        r"Page\s+\d+\s+of\s+\d+"
+        r")",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def clean_message(value):
+        message = normalize_space(value)
+        return normalize_space(stop_pattern.split(message, maxsplit=1)[0])
+
+    cleaned["Message"] = cleaned["Message"].map(clean_message)
+    cleaned = cleaned[cleaned["Message"].str.len().gt(0)].copy()
+    return cleaned.drop_duplicates().reset_index(drop=True)
 
 
 # =====================================================
@@ -795,6 +849,9 @@ try:
         filling_speed_df = extract_filling_speed(full_text, sorted_full_text)
         fill_df = extract_fill_weights(full_text, sorted_full_text, pages)
         safety_df, gmp_df, equipment_df = extract_alarm_tables(pages)
+        safety_df = sanitize_alarm_messages(safety_df)
+        gmp_df = sanitize_alarm_messages(gmp_df)
+        equipment_df = sanitize_alarm_messages(equipment_df)
         audit_df = extract_audit_trail(pages)
 except Exception as exc:
     st.error(f"The PDF could not be processed: {exc}")
@@ -1295,5 +1352,14 @@ with st.expander("Extraction diagnostics"):
             "GMP alarm records": len(gmp_df),
             "Equipment alarm records": len(equipment_df),
             "Audit records": len(audit_df),
+            "Alarm rows containing legend/audit text": int(
+                all_alarms_df["Message"].str.contains(
+                    "Alarm State Legend|Audit Trail|UserID Description|Incoming Alarm|Acknowledgment of alarm",
+                    case=False,
+                    regex=True,
+                    na=False,
+                ).sum()
+            ) if not all_alarms_df.empty else 0,
+            "Parser version": "2026-10-13-v4",
         }
     )
