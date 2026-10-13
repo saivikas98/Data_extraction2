@@ -326,30 +326,47 @@ def extract_fill_weights(text, sorted_text="", pages=None):
 # =====================================================
 # ALARM EXTRACTION
 # =====================================================
+def clean_alarm_chunk(text):
+    """Remove repeating column headers and page footers before parsing alarms."""
+    # The footer begins with Batch Number on every alarm page. Anything after that
+    # is report metadata and must never become part of an alarm message.
+    text = re.split(r"(?im)^\s*Batch\s+Number\s*:", text, maxsplit=1)[0]
+    text = re.sub(r"(?im)^\s*(Timestamp|State|MsgText|Code)\s*$", "", text)
+    text = re.sub(r"(?im)^\s*Page\s+\d+\s+of\s+\d+\s*$", "", text)
+    return text.strip()
+
+
 def parse_alarm_records(section_text, alarm_type):
     columns = ["Timestamp", "State", "Message", "Code", "Alarm Type"]
     rows = []
+    section_text = clean_alarm_chunk(section_text)
+    if not section_text:
+        return pd.DataFrame(columns=columns)
 
-    # Supports a message wrapping onto multiple lines until the numerical code.
+    # A record is exactly: timestamp, state, message, integer code. The lookahead
+    # constrains the message to end before the next timestamp or end of clean chunk.
     record_pattern = re.compile(
         r"(\d{2}/\d{2}/\d{4})\s+"
         r"(\d{2}:\d{2}:\d{2})\s+"
-        r"([+*-])\s+"
+        r"([+*\-])\s+"
         r"(.+?)\s+"
-        r"(\d{2,})\s*(?=(?:\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\s+[+*-])|$)",
+        r"(\d{1,5})\s*"
+        r"(?=(?:\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\s+[+*\-])|$)",
         flags=re.DOTALL,
     )
 
     for match in record_pattern.finditer(section_text):
         message = normalize_space(match.group(4))
-        message = re.sub(
-            r"(?:Page\s+\d+\s+of\s+\d+|Alarms?\s+(?:Safety|GMP|Equipment))",
-            " ",
+        # Defensive removal of any metadata if a report variant puts footer text inline.
+        message = re.split(
+            r"\b(?:Batch Number|Product Name|Report Generated|Printed by|Page \d+ of \d+)\s*:",
             message,
+            maxsplit=1,
             flags=re.IGNORECASE,
-        )
+        )[0]
         message = normalize_space(message)
-
+        if not message:
+            continue
         rows.append(
             {
                 "Timestamp": f"{match.group(1)} {match.group(2)}",
@@ -365,47 +382,84 @@ def parse_alarm_records(section_text, alarm_type):
         frame["Timestamp"] = pd.to_datetime(
             frame["Timestamp"], dayfirst=True, errors="coerce"
         )
-        frame = frame.drop_duplicates().sort_values("Timestamp").reset_index(drop=True)
+        frame = (
+            frame.dropna(subset=["Timestamp"])
+            .drop_duplicates()
+            .sort_values("Timestamp")
+            .reset_index(drop=True)
+        )
     return frame
 
 
-def extract_alarm_section(pages, section_terms, stop_terms, alarm_type):
-    selected_pages = find_section_bounds(pages, section_terms, stop_terms)
-    section_text = "\n".join(page["Text"] for page in selected_pages)
+def extract_alarm_tables(pages):
+    """Parse Safety, GMP and Equipment sections page-by-page with header state."""
+    category_aliases = [
+        ("Safety", re.compile(r"(?im)^\s*(?:Alarms?\s+Safety|Safety\s+Alarms?)\s*$")),
+        ("GMP", re.compile(r"(?im)^\s*(?:Alarms?\s+GMP|GMP\s+Alarms?)\s*$")),
+        ("Equipment", re.compile(r"(?im)^\s*(?:Equipment\s+Alarms?|Alarms?\s+Equipment)\s*$")),
+    ]
+    chunks = {"Safety": [], "GMP": [], "Equipment": []}
+    current_category = None
 
-    if not section_text:
-        return empty_dataframe(
-            ["Timestamp", "State", "Message", "Code", "Alarm Type"]
-        )
+    for page in pages:
+        page_text = page.get("Text", "") or ""
+        # Remove the footer separately on every page. This fixes the observed case
+        # where "Batch Number: ..." was appended to the final message on a page.
+        page_text = re.split(
+            r"(?im)^\s*Batch\s+Number\s*:", page_text, maxsplit=1
+        )[0]
 
-    return parse_alarm_records(section_text, alarm_type)
+        # A page can contain the end of one category and the beginning of another.
+        header_hits = []
+        for category, header_pattern in category_aliases:
+            for hit in header_pattern.finditer(page_text):
+                header_hits.append((hit.start(), hit.end(), category))
+        header_hits.sort(key=lambda item: item[0])
+
+        cursor = 0
+        for hit_start, hit_end, new_category in header_hits:
+            if current_category and hit_start > cursor:
+                chunks[current_category].append(page_text[cursor:hit_start])
+            current_category = new_category
+            cursor = hit_end
+        if current_category and cursor < len(page_text):
+            chunks[current_category].append(page_text[cursor:])
+
+        # Stop carrying alarm state when the audit section begins.
+        if re.search(r"(?im)^\s*Audit\s+Trail\s*$", page_text):
+            current_category = None
+
+    outputs = {}
+    for category in ["Safety", "GMP", "Equipment"]:
+        category_frames = []
+        for chunk in chunks[category]:
+            parsed = parse_alarm_records(chunk, category)
+            if not parsed.empty:
+                category_frames.append(parsed)
+        if category_frames:
+            outputs[category] = (
+                pd.concat(category_frames, ignore_index=True)
+                .drop_duplicates()
+                .sort_values("Timestamp")
+                .reset_index(drop=True)
+            )
+        else:
+            outputs[category] = empty_dataframe(
+                ["Timestamp", "State", "Message", "Code", "Alarm Type"]
+            )
+    return outputs["Safety"], outputs["GMP"], outputs["Equipment"]
 
 
 def extract_safety_alarms(pages):
-    return extract_alarm_section(
-        pages,
-        ["alarms safety", "safety alarms", "alarm safety"],
-        ["alarms gmp", "gmp alarms", "equipment alarms", "audit trail"],
-        "Safety",
-    )
+    return extract_alarm_tables(pages)[0]
 
 
 def extract_gmp_alarms(pages):
-    return extract_alarm_section(
-        pages,
-        ["alarms gmp", "gmp alarms", "alarm gmp"],
-        ["equipment alarms", "alarms equipment", "audit trail"],
-        "GMP",
-    )
+    return extract_alarm_tables(pages)[1]
 
 
 def extract_equipment_alarms(pages):
-    return extract_alarm_section(
-        pages,
-        ["equipment alarms", "alarms equipment", "alarm equipment"],
-        ["audit trail"],
-        "Equipment",
-    )
+    return extract_alarm_tables(pages)[2]
 
 
 # =====================================================
@@ -740,9 +794,7 @@ try:
         production_df = extract_production_counters(full_text, sorted_full_text)
         filling_speed_df = extract_filling_speed(full_text, sorted_full_text)
         fill_df = extract_fill_weights(full_text, sorted_full_text, pages)
-        safety_df = extract_safety_alarms(pages)
-        gmp_df = extract_gmp_alarms(pages)
-        equipment_df = extract_equipment_alarms(pages)
+        safety_df, gmp_df, equipment_df = extract_alarm_tables(pages)
         audit_df = extract_audit_trail(pages)
 except Exception as exc:
     st.error(f"The PDF could not be processed: {exc}")
